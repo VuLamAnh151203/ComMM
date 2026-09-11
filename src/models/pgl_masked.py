@@ -112,6 +112,9 @@ class PGL_MASKED(GeneralRecommender):
         self.hard_mask_temperature = _config_value(
             config, 'hard_mask_temperature', 1.0
         )
+        self.random_mask_seed = int(
+            _config_value(config, 'random_mask_seed', 999)
+        )
         self.user_embedding_mode = str(
             _config_value(config, 'user_embedding_mode', 'shared')
         ).lower()
@@ -135,11 +138,13 @@ class PGL_MASKED(GeneralRecommender):
                 "mask_degree_mode must be either 'full' or 'masked'."
             )
         if self.mask_graph_mode not in {
-            'soft', 'hard', 'double_full', 'svd', 'local_prunning'
+            'soft', 'hard', 'double_full', 'svd', 'local_prunning',
+            'random_fixed', 'random_dynamic'
         }:
             raise ValueError(
                 "mask_graph_mode must be 'soft', 'hard', 'double_full', "
-                "'svd', or 'local_prunning'."
+                "'svd', 'local_prunning', 'random_fixed', or "
+                "'random_dynamic'."
             )
         if self.hard_mask_temperature <= 0.0:
             raise ValueError('hard_mask_temperature must be positive.')
@@ -266,7 +271,8 @@ class PGL_MASKED(GeneralRecommender):
             self.mask_keep_ratio / (1.0 - self.mask_keep_ratio)
         )
         if self.mask_graph_mode in {
-            'double_full', 'svd', 'local_prunning'
+            'double_full', 'svd', 'local_prunning',
+            'random_fixed', 'random_dynamic'
         }:
             self.register_parameter('mask_logits', None)
         else:
@@ -282,6 +288,28 @@ class PGL_MASKED(GeneralRecommender):
             'hard_eval_indices',
             torch.empty(0, dtype=torch.long),
             persistent=False,
+        )
+        random_mode = self.mask_graph_mode in {
+            'random_fixed', 'random_dynamic'
+        }
+        if random_mode:
+            random_train_indices = self._sample_seeded_random_indices(0)
+            if self.mask_graph_mode == 'random_fixed':
+                random_eval_indices = random_train_indices.clone()
+            else:
+                random_eval_indices = self._sample_seeded_random_indices(1)
+        else:
+            random_train_indices = torch.empty(0, dtype=torch.long)
+            random_eval_indices = torch.empty(0, dtype=torch.long)
+        self.register_buffer(
+            'random_train_indices',
+            random_train_indices,
+            persistent=random_mode,
+        )
+        self.register_buffer(
+            'random_eval_indices',
+            random_eval_indices,
+            persistent=random_mode,
         )
         full_edge_weights = torch.ones(edge_index.size(1), dtype=torch.float32)
         full_norm_edge_weights = self._normalized_ui_edge_weights(
@@ -432,6 +460,27 @@ class PGL_MASKED(GeneralRecommender):
             ),
         )
 
+    @property
+    def random_keep_count(self):
+        # Match hard top-k exactly so random and learnable masks are comparable.
+        return self.hard_keep_count
+
+    @torch.no_grad()
+    def _sample_seeded_random_indices(self, seed_offset=0):
+        generator = torch.Generator()
+        generator.manual_seed(self.random_mask_seed + seed_offset)
+        indices = torch.randperm(
+            self.num_interactions, generator=generator
+        )[:self.random_keep_count]
+        return indices.to(self.ui_edge_index.device)
+
+    @torch.no_grad()
+    def _sample_dynamic_random_indices(self):
+        return torch.randperm(
+            self.num_interactions,
+            device=self.ui_edge_index.device,
+        )[:self.random_keep_count]
+
     @torch.no_grad()
     def _sample_hard_train_indices(self, mask_logits):
         uniform_noise = torch.rand_like(mask_logits).clamp_(
@@ -462,6 +511,10 @@ class PGL_MASKED(GeneralRecommender):
             )
         elif self.mask_graph_mode == 'local_prunning':
             self.local_pruned_adj = self._sample_local_pruned_adjacency()
+        elif self.mask_graph_mode == 'random_dynamic':
+            self.random_train_indices = (
+                self._sample_dynamic_random_indices()
+            )
 
     def post_epoch_processing(self):
         if self.mask_graph_mode == 'hard':
@@ -514,9 +567,34 @@ class PGL_MASKED(GeneralRecommender):
             hard_undirected_mask, hard_edge_index
         )
 
+    def _random_masked_ui_adjacency(self):
+        kept_interactions = (
+            self.random_train_indices
+            if self.training
+            else self.random_eval_indices
+        )
+        reverse_interactions = kept_interactions + self.num_interactions
+        kept_undirected = torch.cat(
+            (kept_interactions, reverse_interactions), dim=0
+        )
+        edge_index = self.ui_edge_index[:, kept_undirected]
+        if self.mask_degree_mode == 'full':
+            return self._ui_adjacency_from_weights(
+                self.full_norm_edge_weights[kept_undirected], edge_index
+            )
+        edge_weights = torch.ones(
+            edge_index.size(1),
+            dtype=self.full_norm_edge_weights.dtype,
+            device=edge_index.device,
+        )
+        return self._normalized_ui_adjacency(edge_weights, edge_index)
+
     def _masked_ui_adjacency(self):
         if self.mask_graph_mode == 'double_full':
             return self.norm_adj, None
+
+        if self.mask_graph_mode in {'random_fixed', 'random_dynamic'}:
+            return self._random_masked_ui_adjacency(), None
 
         if self.mask_graph_mode in {'svd', 'local_prunning'}:
             if self.mask_graph_mode == 'svd':
@@ -912,6 +990,20 @@ class PGL_MASKED(GeneralRecommender):
                 'selected_at_keep_ratio': topk_selected.detach().cpu(),
             }
 
+        if self.mask_graph_mode in {'random_fixed', 'random_dynamic'}:
+            train_selected = torch.zeros(
+                self.num_interactions, dtype=torch.bool
+            )
+            eval_selected = torch.zeros(
+                self.num_interactions, dtype=torch.bool
+            )
+            train_selected[self.random_train_indices.cpu()] = True
+            eval_selected[self.random_eval_indices.cpu()] = True
+            masks['random_branch'] = {
+                'train_selected': train_selected,
+                'selected_at_keep_ratio': eval_selected,
+            }
+
         embedding_tables = {}
         for module_name, module in self.named_modules():
             if isinstance(module, nn.Embedding) and module.weight.requires_grad:
@@ -934,6 +1026,7 @@ class PGL_MASKED(GeneralRecommender):
                 'ui_fusion_mode': self.ui_fusion_mode,
                 'user_embedding_mode': self.user_embedding_mode,
                 'mask_keep_ratio': self.mask_keep_ratio,
+                'random_mask_seed': self.random_mask_seed,
                 'num_users': self.n_users,
                 'num_items': self.n_items,
                 'num_interactions': self.num_interactions,

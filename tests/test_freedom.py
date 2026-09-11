@@ -117,10 +117,15 @@ class FreedomTestBase(unittest.TestCase):
             'mask_weight': 0.1,
             'mask_binary_weight': 0.1,
             'hard_mask_temperature': 1.0,
+            'random_mask_seed': 123,
             'user_embedding_mode': 'separate',
             'item_embedding_mode': 'separate',
             'ui_branch_mode': 'dual',
-            'ui_fusion_mode': 'gated_concat',
+            'ui_fusion_mode': 'gated_sum',
+            'ui_gate_mode': 'separate',
+            'mm_gate_mode': 'reuse_ui_item',
+            'cl_weight': 0.5,
+            'cl_temperature': 0.2,
         })
         config.update(overrides)
         return config
@@ -186,7 +191,8 @@ class FreedomMaskedGraphTest(FreedomTestBase):
 
     def test_all_mask_modes_and_train_eval_graph_behavior(self):
         for graph_mode in (
-            'soft', 'hard', 'double_full', 'svd', 'local_prunning'
+            'soft', 'hard', 'double_full', 'svd', 'local_prunning',
+            'random_fixed', 'random_dynamic'
         ):
             with self.subTest(graph_mode=graph_mode):
                 with tempfile.TemporaryDirectory() as root:
@@ -214,10 +220,14 @@ class FreedomMaskedGraphTest(FreedomTestBase):
                         self.assertEqual(
                             adjacency._nnz(), 2 * model.local_keep_count
                         )
+                    if graph_mode in {'random_fixed', 'random_dynamic'}:
+                        self.assertEqual(
+                            adjacency._nnz(), 2 * model.random_keep_count
+                        )
 
                     users, items = model.forward()
-                    self.assertEqual(tuple(users.shape), (3, 6))
-                    self.assertEqual(tuple(items.shape), (4, 6))
+                    self.assertEqual(tuple(users.shape), (3, 3))
+                    self.assertEqual(tuple(items.shape), (4, 3))
                     loss = model.calculate_loss(self.interaction())
                     self.assertTrue(torch.isfinite(loss))
                     loss.backward()
@@ -233,6 +243,65 @@ class FreedomMaskedGraphTest(FreedomTestBase):
                             eval_adjacency.to_dense(),
                             model.norm_adj.to_dense(),
                         )
+
+    def test_fixed_and_dynamic_random_masks(self):
+        for graph_mode in ('random_fixed', 'random_dynamic'):
+            with self.subTest(graph_mode=graph_mode):
+                with tempfile.TemporaryDirectory() as root:
+                    self.write_features(root)
+                    model = self.make_model(
+                        root, mask_graph_mode=graph_mode
+                    )
+                    self.assertIsNone(model.mask_logits)
+                    initial_train_buffer = model.random_train_indices
+                    fixed_eval_indices = model.random_eval_indices.clone()
+
+                    model.train()
+                    model.pre_epoch_processing()
+                    if graph_mode == 'random_fixed':
+                        self.assertIs(
+                            model.random_train_indices,
+                            initial_train_buffer,
+                        )
+                        torch.testing.assert_close(
+                            model.random_train_indices,
+                            model.random_eval_indices,
+                        )
+                    else:
+                        self.assertIsNot(
+                            model.random_train_indices,
+                            initial_train_buffer,
+                        )
+                        torch.testing.assert_close(
+                            model.random_eval_indices, fixed_eval_indices
+                        )
+
+                    model.eval()
+                    expected_eval = model._masked_ui_adjacency()[0].to_dense()
+                    model.train()
+                    model.pre_epoch_processing()
+                    model.eval()
+                    torch.testing.assert_close(
+                        model._masked_ui_adjacency()[0].to_dense(),
+                        expected_eval,
+                    )
+
+                    restored = self.make_model(
+                        root, mask_graph_mode=graph_mode
+                    )
+                    restored.load_state_dict(model.state_dict())
+                    restored.eval()
+                    torch.testing.assert_close(
+                        restored._masked_ui_adjacency()[0].to_dense(),
+                        expected_eval,
+                    )
+                    artifacts = restored.get_analysis_artifacts()
+                    self.assertEqual(
+                        int(artifacts['masks']['random_branch'][
+                            'selected_at_keep_ratio'
+                        ].sum()),
+                        restored.random_keep_count,
+                    )
 
     def test_freedom_dropout_resampling_does_not_touch_mask_branch(self):
         with tempfile.TemporaryDirectory() as root:
@@ -284,10 +353,10 @@ class FreedomMaskedGraphTest(FreedomTestBase):
                                 model.masked_item_id_embedding.weight.grad
                             )
 
-    def test_fusion_output_dimensions_have_no_concat_projection(self):
+    def test_fusion_output_dimensions_preserve_freedom_residual(self):
         cases = (
             ('dual', 'gated_sum', 3),
-            ('dual', 'gated_concat', 6),
+            ('dual', 'gated_concat', 3),
             ('masked_only', 'gated_sum', 3),
         )
         for branch_mode, fusion_mode, expected_dim in cases:
@@ -303,7 +372,106 @@ class FreedomMaskedGraphTest(FreedomTestBase):
                     users, items = model.forward()
                     self.assertEqual(users.shape[1], expected_dim)
                     self.assertEqual(items.shape[1], expected_dim)
-                    self.assertFalse(hasattr(model, 'fusion_projection'))
+                    if branch_mode == 'dual' and fusion_mode == 'gated_concat':
+                        self.assertIsNotNone(model.user_concat_projection)
+                        self.assertIsNotNone(model.item_concat_projection)
+
+    def test_ui_and_multimodal_gate_mode_matrix(self):
+        for ui_gate_mode in ('shared', 'separate'):
+            for mm_gate_mode in ('reuse_ui_item', 'separate'):
+                with self.subTest(ui=ui_gate_mode, mm=mm_gate_mode):
+                    with tempfile.TemporaryDirectory() as root:
+                        self.write_features(root)
+                        model = self.make_model(
+                            root,
+                            mask_graph_mode='double_full',
+                            ui_gate_mode=ui_gate_mode,
+                            mm_gate_mode=mm_gate_mode,
+                        )
+                        representations = model._encode()
+                        torch.testing.assert_close(
+                            representations['items'],
+                            representations['fused_ui_items']
+                            + representations['mm_items'],
+                        )
+                        if ui_gate_mode == 'shared':
+                            self.assertIsNotNone(model.fusion_gate)
+                            self.assertIsNone(model.user_fusion_gate)
+                            self.assertIsNone(model.item_fusion_gate)
+                        else:
+                            self.assertIsNone(model.fusion_gate)
+                            self.assertIsNotNone(model.user_fusion_gate)
+                            self.assertIsNotNone(model.item_fusion_gate)
+                        if mm_gate_mode == 'reuse_ui_item':
+                            self.assertIsNone(model.mm_fusion_gate)
+                            torch.testing.assert_close(
+                                representations['mm_gate'],
+                                representations['item_gate'],
+                            )
+                        else:
+                            self.assertIsNotNone(model.mm_fusion_gate)
+
+                        model.calculate_loss(self.interaction()).backward()
+                        if ui_gate_mode == 'shared':
+                            self.assertIsNotNone(model.fusion_gate.weight.grad)
+                        else:
+                            self.assertIsNotNone(
+                                model.user_fusion_gate.weight.grad
+                            )
+                            self.assertIsNotNone(
+                                model.item_fusion_gate.weight.grad
+                            )
+                        if mm_gate_mode == 'separate':
+                            self.assertIsNotNone(
+                                model.mm_fusion_gate.weight.grad
+                            )
+
+    def test_shared_item_table_uses_one_multimodal_representation(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.write_features(root)
+            model = self.make_model(
+                root,
+                mask_graph_mode='double_full',
+                item_embedding_mode='shared',
+                mm_gate_mode='separate',
+            )
+            representations = model._encode()
+            self.assertIsNone(model.masked_item_id_embedding)
+            self.assertIsNone(model.mm_fusion_gate)
+            self.assertIsNone(representations['mm_gate'])
+            torch.testing.assert_close(
+                representations['full_mm_items'],
+                representations['masked_mm_items'],
+            )
+            torch.testing.assert_close(
+                representations['items'],
+                representations['fused_ui_items']
+                + representations['mm_items'],
+            )
+
+    def test_contrastive_loss_is_between_pre_fusion_ui_views(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.write_features(root)
+            model = self.make_model(root, mask_graph_mode='double_full')
+            loss = model.calculate_loss(self.interaction())
+            self.assertTrue(torch.isfinite(loss))
+            self.assertGreater(
+                float(model.latest_loss_components['contrastive']), 0.0
+            )
+            loss.backward()
+            self.assertIsNotNone(model.user_embedding.weight.grad)
+            self.assertIsNotNone(model.masked_user_embedding.weight.grad)
+
+            masked_only = self.make_model(
+                root,
+                ui_branch_mode='masked_only',
+                ui_fusion_mode='gated_sum',
+            )
+            masked_only.calculate_loss(self.interaction())
+            self.assertEqual(
+                float(masked_only.latest_loss_components['contrastive']),
+                0.0,
+            )
 
     def test_auxiliary_loss_with_both_or_one_modality(self):
         for image, text in ((True, True), (True, False), (False, True)):
@@ -313,8 +481,8 @@ class FreedomMaskedGraphTest(FreedomTestBase):
                     model = self.make_model(root)
                     loss = model.calculate_loss(self.interaction())
                     self.assertTrue(torch.isfinite(loss))
-                    self.assertNotIn('cl_weight', model.__dict__)
-                    self.assertEqual(model.final_embedding_dim, 6)
+                    self.assertIn('cl_weight', model.__dict__)
+                    self.assertEqual(model.final_embedding_dim, 3)
 
     def test_state_restore_artifacts_and_deterministic_inference(self):
         with tempfile.TemporaryDirectory() as root:
@@ -342,7 +510,11 @@ class FreedomMaskedGraphTest(FreedomTestBase):
                 artifacts['metadata']['item_embedding_mode'], 'separate'
             )
             self.assertEqual(
-                artifacts['metadata']['final_embedding_dim'], 6
+                artifacts['metadata']['final_embedding_dim'], 3
+            )
+            self.assertEqual(
+                artifacts['metadata']['architecture'],
+                'freedom_residual_dual_ui',
             )
             self.assertIn(
                 'masked_item_id_embedding.weight',

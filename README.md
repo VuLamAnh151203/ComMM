@@ -68,8 +68,16 @@ python src/main.py -m FREEDOM_MASKED -d movielens_1m \
 
 `FREEDOM_MASKED.yaml` mặc định dùng hard mask, hai bộ user/item-ID embedding
 riêng và `gated_concat` giữ nguyên output `2d`. Các mode mask được hỗ trợ là
-`soft`, `hard`, `double_full`, `svd`, `local_prunning`. Checkpoint, artifact mask
-và top-k recommendation được ghi theo các đường dẫn trong config.
+`soft`, `hard`, `double_full`, `svd`, `local_prunning`, `random_fixed` và
+`random_dynamic`. `random_fixed` giữ một random mask xuyên suốt; `random_dynamic`
+sample lại khi bắt đầu mỗi epoch train nhưng dùng một evaluation mask cố định
+theo `random_mask_seed`. Checkpoint, artifact mask và top-k recommendation được
+ghi theo các đường dẫn trong config.
+
+Implementation `FREEDOM_MASKED` cũ được giữ tại
+`src/models/freedom_masked_legacy.py`. Implementation mới giữ residual của
+FREEDOM (`I_UI + I_MM`), hỗ trợ `ui_gate_mode: shared|separate`,
+`mm_gate_mode: reuse_ui_item|separate`, và contrastive loss giữa hai U-I view.
 
 ## Kiểm thử
 

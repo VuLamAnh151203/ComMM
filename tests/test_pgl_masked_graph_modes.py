@@ -85,6 +85,7 @@ class PGLGraphModeTest(unittest.TestCase):
             'mask_keep_ratio': 0.4,
             'mask_degree_mode': 'full',
             'mask_graph_mode': graph_mode,
+            'random_mask_seed': 123,
             'user_embedding_mode': 'separate',
             'ui_branch_mode': ui_branch_mode,
             'ui_fusion_mode': ui_fusion_mode,
@@ -141,7 +142,9 @@ class PGLGraphModeTest(unittest.TestCase):
             torch.tensor([0, 3]),
             torch.tensor([2, 0]),
         )
-        self.assertTrue(torch.isfinite(model.calculate_loss(interaction)))
+        loss = model.calculate_loss(interaction)
+        self.assertTrue(torch.isfinite(loss))
+        return loss
 
     def test_svd_uses_full_and_static_svd_branches(self):
         with tempfile.TemporaryDirectory() as temporary_root:
@@ -224,6 +227,67 @@ class PGLGraphModeTest(unittest.TestCase):
                 ],
                 'gated_concat',
             )
+
+    def test_fixed_and_dynamic_random_masks(self):
+        for graph_mode in ('random_fixed', 'random_dynamic'):
+            with self.subTest(graph_mode=graph_mode):
+                with tempfile.TemporaryDirectory() as temporary_root:
+                    self.write_features(temporary_root)
+                    model = self.make_model(temporary_root, graph_mode)
+                    self.assertIsNone(model.mask_logits)
+                    initial_train_buffer = model.random_train_indices
+                    fixed_eval_indices = model.random_eval_indices.clone()
+
+                    model.train()
+                    model.pre_epoch_processing()
+                    adjacency, probabilities = model._masked_ui_adjacency()
+                    self.assertIsNone(probabilities)
+                    self.assertEqual(
+                        adjacency._nnz(), 2 * model.random_keep_count
+                    )
+                    self.assert_forward_and_loss(model).backward()
+                    if graph_mode == 'random_fixed':
+                        self.assertIs(
+                            model.random_train_indices,
+                            initial_train_buffer,
+                        )
+                        torch.testing.assert_close(
+                            model.random_train_indices,
+                            model.random_eval_indices,
+                        )
+                    else:
+                        self.assertIsNot(
+                            model.random_train_indices,
+                            initial_train_buffer,
+                        )
+                        torch.testing.assert_close(
+                            model.random_eval_indices, fixed_eval_indices
+                        )
+
+                    model.eval()
+                    expected_eval = model._masked_ui_adjacency()[0].to_dense()
+                    model.train()
+                    model.pre_epoch_processing()
+                    model.eval()
+                    torch.testing.assert_close(
+                        model._masked_ui_adjacency()[0].to_dense(),
+                        expected_eval,
+                    )
+
+                    restored = self.make_model(temporary_root, graph_mode)
+                    restored.load_state_dict(model.state_dict())
+                    restored.eval()
+                    torch.testing.assert_close(
+                        restored._masked_ui_adjacency()[0].to_dense(),
+                        expected_eval,
+                    )
+                    artifacts = restored.get_analysis_artifacts()
+                    self.assertEqual(
+                        int(artifacts['masks']['random_branch'][
+                            'selected_at_keep_ratio'
+                        ].sum()),
+                        restored.random_keep_count,
+                    )
 
 
 if __name__ == '__main__':

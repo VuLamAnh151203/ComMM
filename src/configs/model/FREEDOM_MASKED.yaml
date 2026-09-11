@@ -4,6 +4,8 @@ feat_embed_dim: 64
 learning_rate_scheduler: [0.96, 50]
 learning_rate: 0.001
 reg_weight: 0.0
+cl_weight: 0.5
+cl_temperature: 0.2
 
 n_mm_layers: 1
 n_ui_layers: 2
@@ -14,8 +16,11 @@ mm_image_weight: 0.1
 dropout: 0.8
 
 # Learned/static graph used by the independent masked branch.
+# Also supports random_fixed and random_dynamic non-learnable masks.
+# Set dropout: 0.0 for a strict Full + Random Mask experiment.
 mask_graph_mode: hard
 mask_keep_ratio: 0.3
+random_mask_seed: 999
 # full: retain normalization from the full graph; masked: recompute degrees.
 mask_degree_mode: full
 mask_weight: 0.1
@@ -27,8 +32,13 @@ user_embedding_mode: separate
 item_embedding_mode: separate
 # dual: FREEDOM + mask; masked_only: mask branch only.
 ui_branch_mode: dual
-# gated_sum keeps d; gated_concat keeps 2d without a projection.
-ui_fusion_mode: gated_concat
+# Both modes output d; gated_concat uses an explicit 2d -> d projection.
+ui_fusion_mode: gated_sum
+# shared: one gate network for both node types; separate: user/item gates.
+ui_gate_mode: separate
+# reuse_ui_item: reuse the U-I item gate for I-I weighted fusion;
+# separate: learn an independent multimodal gate.
+mm_gate_mode: reuse_ui_item
 
 save_analysis_artifacts: True
 restore_best_model: True

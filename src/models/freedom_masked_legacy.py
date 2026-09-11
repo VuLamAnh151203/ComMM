@@ -1,10 +1,8 @@
-"""FREEDOM with a second, configurable masked user-item branch.
+"""Legacy FREEDOM_MASKED implementation kept for reproducibility.
 
-The original FREEDOM structure is preserved: collaborative U-I output is
-added to an item representation propagated through the frozen multimodal I-I
-graph.  Masking only creates a second U-I view.  With separate item tables,
-both tables also pass through the same frozen I-I graph and their outputs are
-combined by a weighted sum.
+The FREEDOM branch keeps its original degree-sensitive epoch dropout.  The
+second branch is controlled by a learned/static mask and never receives that
+dropout.  There is deliberately no contrastive-learning objective.
 """
 
 import math
@@ -13,14 +11,13 @@ import numpy as np
 import scipy.sparse as sp
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from scipy.sparse.linalg import svds
 
 from models.freedom import FREEDOM, _config_value
 
 
 class _ObservedEdgeSparseMM(torch.autograd.Function):
-    """Sparse matrix multiplication with edge-only adjacency gradients."""
+    """Sparse multiplication whose adjacency gradient is edge-only."""
 
     @staticmethod
     def forward(ctx, indices, values, size, embeddings):
@@ -63,21 +60,11 @@ class _ObservedEdgeSparseMM(torch.autograd.Function):
         return None, grad_values, None, grad_embeddings
 
 
-class FREEDOM_MASKED(FREEDOM):
-    """FREEDOM whose collaborative path has original and masked views."""
-
-    MASK_GRAPH_MODES = {
-        'soft',
-        'hard',
-        'double_full',
-        'svd',
-        'local_prunning',
-        'random_fixed',
-        'random_dynamic',
-    }
+class FREEDOM_MASKED_LEGACY(FREEDOM):
+    """Dual-branch FREEDOM with configurable user-item graph masking."""
 
     def __init__(self, config, dataset):
-        super(FREEDOM_MASKED, self).__init__(config, dataset)
+        super(FREEDOM_MASKED_LEGACY, self).__init__(config, dataset)
 
         self.mask_weight = float(_config_value(config, 'mask_weight', 0.1))
         self.mask_keep_ratio = float(
@@ -98,7 +85,6 @@ class FREEDOM_MASKED(FREEDOM):
         self.random_mask_seed = int(
             _config_value(config, 'random_mask_seed', 999)
         )
-
         self.user_embedding_mode = str(
             _config_value(config, 'user_embedding_mode', 'separate')
         ).lower()
@@ -109,28 +95,44 @@ class FREEDOM_MASKED(FREEDOM):
             _config_value(config, 'ui_branch_mode', 'dual')
         ).lower()
         self.ui_fusion_mode = str(
-            _config_value(config, 'ui_fusion_mode', 'gated_sum')
+            _config_value(config, 'ui_fusion_mode', 'gated_concat')
         ).lower()
-        self.ui_gate_mode = str(
-            _config_value(config, 'ui_gate_mode', 'separate')
-        ).lower()
-        self.mm_gate_mode = str(
-            _config_value(config, 'mm_gate_mode', 'reuse_ui_item')
-        ).lower()
+        self._validate_mask_config()
 
-        self.cl_weight = float(_config_value(config, 'cl_weight', 0.5))
-        self.cl_temperature = float(
-            _config_value(config, 'cl_temperature', 0.2)
-        )
-        self._validate_masked_config()
+        if self.user_embedding_mode == 'separate':
+            self.masked_user_embedding = nn.Embedding(
+                self.n_users, self.embedding_dim
+            )
+            nn.init.xavier_uniform_(self.masked_user_embedding.weight)
+        else:
+            self.masked_user_embedding = None
 
-        self._initialize_masked_embedding_tables()
-        self._initialize_fusion_modules()
-        self._initialize_mask_graph()
+        if self.item_embedding_mode == 'separate':
+            self.masked_item_id_embedding = nn.Embedding(
+                self.n_items, self.embedding_dim
+            )
+            nn.init.xavier_uniform_(self.masked_item_id_embedding.weight)
+        else:
+            self.masked_item_id_embedding = None
 
-        # Every final representation is d-dimensional, including concat after
-        # its explicit 2d -> d projection, so the FREEDOM residual is valid.
-        self.final_embedding_dim = self.embedding_dim
+        if self.ui_branch_mode == 'dual':
+            self.fusion_gate = nn.Linear(
+                2 * self.embedding_dim, self.embedding_dim
+            )
+            nn.init.xavier_uniform_(self.fusion_gate.weight)
+            nn.init.zeros_(self.fusion_gate.bias)
+        else:
+            self.fusion_gate = None
+
+        if (
+            self.ui_branch_mode == 'dual'
+            and self.ui_fusion_mode == 'gated_concat'
+        ):
+            self.final_embedding_dim = 2 * self.embedding_dim
+        else:
+            self.final_embedding_dim = self.embedding_dim
+
+        # Auxiliary feature BPR must use the same dimension as final scores.
         if self.image_embedding is not None:
             self.image_aux_projection = self._make_aux_projection(
                 self.final_embedding_dim
@@ -139,9 +141,11 @@ class FREEDOM_MASKED(FREEDOM):
             self.text_aux_projection = self._make_aux_projection(
                 self.final_embedding_dim
             )
+
+        self._initialize_mask_graph()
         self.latest_loss_components = {}
 
-    def _validate_masked_config(self):
+    def _validate_mask_config(self):
         if not 0.0 < self.mask_keep_ratio < 1.0:
             raise ValueError('mask_keep_ratio must be between 0 and 1.')
         if self.mask_weight < 0.0 or self.mask_binary_weight < 0.0:
@@ -150,11 +154,14 @@ class FREEDOM_MASKED(FREEDOM):
             raise ValueError(
                 "mask_degree_mode must be either 'full' or 'masked'."
             )
-        if self.mask_graph_mode not in self.MASK_GRAPH_MODES:
+        if self.mask_graph_mode not in {
+            'soft', 'hard', 'double_full', 'svd', 'local_prunning',
+            'random_fixed', 'random_dynamic'
+        }:
             raise ValueError(
-                'Unsupported mask_graph_mode: {}.'.format(
-                    self.mask_graph_mode
-                )
+                "mask_graph_mode must be 'soft', 'hard', 'double_full', "
+                "'svd', 'local_prunning', 'random_fixed', or "
+                "'random_dynamic'."
             )
         if self.hard_mask_temperature <= 0.0:
             raise ValueError('hard_mask_temperature must be positive.')
@@ -174,95 +181,21 @@ class FREEDOM_MASKED(FREEDOM):
             raise ValueError(
                 "ui_fusion_mode must be 'gated_sum' or 'gated_concat'."
             )
-        if self.ui_gate_mode not in {'shared', 'separate'}:
-            raise ValueError(
-                "ui_gate_mode must be 'shared' or 'separate'."
-            )
-        if self.mm_gate_mode not in {'reuse_ui_item', 'separate'}:
-            raise ValueError(
-                "mm_gate_mode must be 'reuse_ui_item' or 'separate'."
-            )
-        if self.cl_weight < 0.0:
-            raise ValueError('cl_weight cannot be negative.')
-        if self.cl_temperature <= 0.0:
-            raise ValueError('cl_temperature must be positive.')
-
-    def _initialize_masked_embedding_tables(self):
-        if self.user_embedding_mode == 'separate':
-            self.masked_user_embedding = nn.Embedding(
-                self.n_users, self.embedding_dim
-            )
-            nn.init.xavier_uniform_(self.masked_user_embedding.weight)
-        else:
-            self.masked_user_embedding = None
-
-        if self.item_embedding_mode == 'separate':
-            self.masked_item_id_embedding = nn.Embedding(
-                self.n_items, self.embedding_dim
-            )
-            nn.init.xavier_uniform_(self.masked_item_id_embedding.weight)
-        else:
-            self.masked_item_id_embedding = None
-
-    @staticmethod
-    def _new_gate(embedding_dim):
-        gate = nn.Linear(2 * embedding_dim, embedding_dim)
-        nn.init.xavier_uniform_(gate.weight)
-        nn.init.zeros_(gate.bias)
-        return gate
-
-    @staticmethod
-    def _new_concat_projection(embedding_dim):
-        projection = nn.Linear(2 * embedding_dim, embedding_dim)
-        nn.init.xavier_uniform_(projection.weight)
-        nn.init.zeros_(projection.bias)
-        return projection
-
-    def _initialize_fusion_modules(self):
-        self.fusion_gate = None
-        self.user_fusion_gate = None
-        self.item_fusion_gate = None
-        self.fusion_projection = None
-        self.user_concat_projection = None
-        self.item_concat_projection = None
-        self.mm_fusion_gate = None
-
-        if self.ui_branch_mode != 'dual':
-            return
-
-        if self.ui_gate_mode == 'shared':
-            self.fusion_gate = self._new_gate(self.embedding_dim)
-            if self.ui_fusion_mode == 'gated_concat':
-                self.fusion_projection = self._new_concat_projection(
-                    self.embedding_dim
-                )
-        else:
-            self.user_fusion_gate = self._new_gate(self.embedding_dim)
-            self.item_fusion_gate = self._new_gate(self.embedding_dim)
-            if self.ui_fusion_mode == 'gated_concat':
-                self.user_concat_projection = (
-                    self._new_concat_projection(self.embedding_dim)
-                )
-                self.item_concat_projection = (
-                    self._new_concat_projection(self.embedding_dim)
-                )
-
         if (
-            self.item_embedding_mode == 'separate'
-            and self.mm_gate_mode == 'separate'
+            self.ui_branch_mode == 'masked_only'
+            and self.ui_fusion_mode == 'gated_concat'
         ):
-            self.mm_fusion_gate = self._new_gate(self.embedding_dim)
+            raise ValueError(
+                "ui_fusion_mode='gated_concat' requires ui_branch_mode='dual'."
+            )
 
     def _initialize_mask_graph(self):
         initial_logit = math.log(
             self.mask_keep_ratio / (1.0 - self.mask_keep_ratio)
         )
         if self.mask_graph_mode in {
-            'double_full',
-            'svd',
-            'local_prunning',
-            'random_fixed',
-            'random_dynamic',
+            'double_full', 'svd', 'local_prunning',
+            'random_fixed', 'random_dynamic'
         }:
             self.register_parameter('mask_logits', None)
         else:
@@ -280,7 +213,6 @@ class FREEDOM_MASKED(FREEDOM):
             torch.empty(0, dtype=torch.long),
             persistent=False,
         )
-
         random_mode = self.mask_graph_mode in {
             'random_fixed', 'random_dynamic'
         }
@@ -303,7 +235,6 @@ class FREEDOM_MASKED(FREEDOM):
             random_eval_indices,
             persistent=random_mode,
         )
-
         self.register_buffer('svd_adj', None)
         self.register_buffer('local_pruned_adj', None)
         if self.mask_graph_mode == 'svd':
@@ -370,6 +301,22 @@ class FREEDOM_MASKED(FREEDOM):
     def random_keep_count(self):
         return self.hard_keep_count
 
+    @torch.no_grad()
+    def _sample_seeded_random_indices(self, seed_offset=0):
+        generator = torch.Generator()
+        generator.manual_seed(self.random_mask_seed + seed_offset)
+        indices = torch.randperm(
+            self.num_interactions, generator=generator
+        )[:self.random_keep_count]
+        return indices.to(self.ui_edge_index.device)
+
+    @torch.no_grad()
+    def _sample_dynamic_random_indices(self):
+        return torch.randperm(
+            self.num_interactions,
+            device=self.ui_edge_index.device,
+        )[:self.random_keep_count]
+
     @property
     def local_keep_count(self):
         return max(
@@ -428,23 +375,9 @@ class FREEDOM_MASKED(FREEDOM):
             dtype=self.full_norm_edge_weights.dtype,
             device=edge_index.device,
         )
-        return self._normalized_ui_adjacency(edge_weights, edge_index)
-
-    @torch.no_grad()
-    def _sample_seeded_random_indices(self, seed_offset=0):
-        generator = torch.Generator()
-        generator.manual_seed(self.random_mask_seed + seed_offset)
-        indices = torch.randperm(
-            self.num_interactions, generator=generator
-        )[:self.random_keep_count]
-        return indices.to(self.ui_edge_index.device)
-
-    @torch.no_grad()
-    def _sample_dynamic_random_indices(self):
-        return torch.randperm(
-            self.num_interactions,
-            device=self.ui_edge_index.device,
-        )[:self.random_keep_count]
+        return self._normalized_ui_adjacency(
+            edge_weights, edge_index
+        )
 
     @torch.no_grad()
     def _sample_hard_train_indices(self, logits):
@@ -462,6 +395,7 @@ class FREEDOM_MASKED(FREEDOM):
         ).indices
 
     def pre_epoch_processing(self):
+        # These two samplers intentionally write disjoint graph state.
         self._resample_freedom_adjacency()
         if self.mask_graph_mode == 'hard':
             self.hard_train_indices = self._sample_hard_train_indices(
@@ -596,165 +530,85 @@ class FREEDOM_MASKED(FREEDOM):
             embeddings.append(current)
         return torch.stack(embeddings, dim=1).mean(dim=1)
 
-    def _masked_user_table(self):
-        if self.masked_user_embedding is None:
-            return self.user_embedding.weight
-        return self.masked_user_embedding.weight
+    def _masked_initial_embeddings(self):
+        users = (
+            self.user_embedding.weight
+            if self.masked_user_embedding is None
+            else self.masked_user_embedding.weight
+        )
+        items = (
+            self.item_id_embedding.weight
+            if self.masked_item_id_embedding is None
+            else self.masked_item_id_embedding.weight
+        )
+        return torch.cat((users, items), dim=0)
 
-    def _masked_item_table(self):
-        if self.masked_item_id_embedding is None:
-            return self.item_id_embedding.weight
-        return self.masked_item_id_embedding.weight
-
-    def _ui_fusion_modules(self, node_type):
-        if self.ui_gate_mode == 'shared':
-            return self.fusion_gate, self.fusion_projection
-        if node_type == 'user':
-            return self.user_fusion_gate, self.user_concat_projection
-        return self.item_fusion_gate, self.item_concat_projection
-
-    def _fuse_ui_pair(self, original, masked, node_type):
-        gate_module, projection = self._ui_fusion_modules(node_type)
+    def _fuse_ui_branches(self, full_embeddings, masked_embeddings):
         gate = torch.sigmoid(
-            gate_module(torch.cat((original, masked), dim=-1))
+            self.fusion_gate(
+                torch.cat((full_embeddings, masked_embeddings), dim=-1)
+            )
         )
-        gated_original = gate * original
-        gated_masked = (1.0 - gate) * masked
+        gated_full = gate * full_embeddings
+        gated_masked = (1.0 - gate) * masked_embeddings
         if self.ui_fusion_mode == 'gated_concat':
-            fused = projection(
-                torch.cat((gated_original, gated_masked), dim=-1)
-            )
-        else:
-            fused = gated_original + gated_masked
-        return fused, gate
-
-    def _fuse_mm_items(self, original_items, masked_items, item_gate):
-        if self.mm_gate_mode == 'reuse_ui_item':
-            mm_gate = item_gate
-        else:
-            mm_gate = torch.sigmoid(
-                self.mm_fusion_gate(
-                    torch.cat((original_items, masked_items), dim=-1)
-                )
-            )
-        fused = (
-            mm_gate * original_items
-            + (1.0 - mm_gate) * masked_items
-        )
-        return fused, mm_gate
+            return torch.cat((gated_full, gated_masked), dim=-1), gate
+        return gated_full + gated_masked, gate
 
     def _encode(self):
-        masked_user_table = self._masked_user_table()
-        masked_item_table = self._masked_item_table()
-        masked_initial = torch.cat(
-            (masked_user_table, masked_item_table), dim=0
-        )
         masked_adjacency, probabilities = self._masked_ui_adjacency()
         masked_embeddings = self._propagate_ui_graph(
-            masked_adjacency, masked_initial
+            masked_adjacency, self._masked_initial_embeddings()
         )
-        masked_users, masked_ui_items = torch.split(
+        masked_users, masked_items = torch.split(
             masked_embeddings, (self.n_users, self.n_items), dim=0
         )
 
         if self.ui_branch_mode == 'masked_only':
-            masked_mm_items = self._propagate_mm_graph(masked_item_table)
+            final_items = self._propagate_mm_graph(masked_items)
             return {
                 'users': masked_users,
-                'items': masked_ui_items + masked_mm_items,
-                'fused_ui_items': masked_ui_items,
-                'mm_items': masked_mm_items,
+                'items': final_items,
+                'fused_items': masked_items,
                 'full_users': None,
                 'full_items': None,
                 'masked_users': masked_users,
-                'masked_items': masked_ui_items,
-                'full_mm_items': None,
-                'masked_mm_items': masked_mm_items,
-                'user_gate': None,
-                'item_gate': None,
-                'mm_gate': None,
+                'masked_items': masked_items,
                 'mask': probabilities,
             }
 
-        original_initial = torch.cat(
+        full_initial = torch.cat(
             (self.user_embedding.weight, self.item_id_embedding.weight),
             dim=0,
         )
-        original_embeddings = self._propagate_ui_graph(
-            self._freedom_ui_adjacency(), original_initial
+        full_embeddings = self._propagate_ui_graph(
+            self._freedom_ui_adjacency(), full_initial
         )
-        original_users, original_ui_items = torch.split(
-            original_embeddings, (self.n_users, self.n_items), dim=0
-        )
-
-        fused_users, user_gate = self._fuse_ui_pair(
-            original_users, masked_users, 'user'
-        )
-        fused_ui_items, item_gate = self._fuse_ui_pair(
-            original_ui_items, masked_ui_items, 'item'
+        full_users, full_items = torch.split(
+            full_embeddings, (self.n_users, self.n_items), dim=0
         )
 
-        original_mm_items = self._propagate_mm_graph(
-            self.item_id_embedding.weight
+        fused_embeddings, _ = self._fuse_ui_branches(
+            full_embeddings, masked_embeddings
         )
-        if self.item_embedding_mode == 'shared':
-            masked_mm_items = original_mm_items
-            fused_mm_items = original_mm_items
-            mm_gate = None
-        else:
-            masked_mm_items = self._propagate_mm_graph(
-                self.masked_item_id_embedding.weight
-            )
-            fused_mm_items, mm_gate = self._fuse_mm_items(
-                original_mm_items, masked_mm_items, item_gate
-            )
-
+        fused_users, fused_items = torch.split(
+            fused_embeddings, (self.n_users, self.n_items), dim=0
+        )
+        final_items = self._propagate_mm_graph(fused_items)
         return {
             'users': fused_users,
-            'items': fused_ui_items + fused_mm_items,
-            'fused_ui_items': fused_ui_items,
-            'mm_items': fused_mm_items,
-            'full_users': original_users,
-            'full_items': original_ui_items,
+            'items': final_items,
+            'fused_items': fused_items,
+            'full_users': full_users,
+            'full_items': full_items,
             'masked_users': masked_users,
-            'masked_items': masked_ui_items,
-            'full_mm_items': original_mm_items,
-            'masked_mm_items': masked_mm_items,
-            'user_gate': user_gate,
-            'item_gate': item_gate,
-            'mm_gate': mm_gate,
+            'masked_items': masked_items,
             'mask': probabilities,
         }
 
     def forward(self):
         representations = self._encode()
         return representations['users'], representations['items']
-
-    def info_nce(self, first_view, second_view):
-        first_view = F.normalize(first_view, dim=1)
-        second_view = F.normalize(second_view, dim=1)
-        logits = torch.matmul(first_view, second_view.transpose(0, 1))
-        logits = logits / self.cl_temperature
-        labels = torch.arange(logits.size(0), device=logits.device)
-        return 0.5 * (
-            F.cross_entropy(logits, labels)
-            + F.cross_entropy(logits.transpose(0, 1), labels)
-        )
-
-    def _contrastive_loss(self, representations, users, positive_items):
-        if self.cl_weight == 0.0 or self.ui_branch_mode != 'dual':
-            return representations['users'].new_zeros(())
-        unique_users = torch.unique(users)
-        unique_items = torch.unique(positive_items)
-        user_loss = self.info_nce(
-            representations['full_users'][unique_users],
-            representations['masked_users'][unique_users],
-        )
-        item_loss = self.info_nce(
-            representations['full_items'][unique_items],
-            representations['masked_items'][unique_items],
-        )
-        return 0.5 * (user_loss + item_loss)
 
     def _auxiliary_losses(
         self, all_users, users, positive_items, negative_items
@@ -810,9 +664,6 @@ class FREEDOM_MASKED(FREEDOM):
         visual_loss, text_loss = self._auxiliary_losses(
             all_users, users, positive_items, negative_items
         )
-        contrastive_loss = self._contrastive_loss(
-            representations, users, positive_items
-        )
         (
             mask_regularization,
             budget_loss,
@@ -821,18 +672,15 @@ class FREEDOM_MASKED(FREEDOM):
         ) = self._mask_regularization(
             representations['mask'], ranking_loss
         )
-
         total_loss = (
             ranking_loss
             + self.reg_weight * (visual_loss + text_loss)
-            + self.cl_weight * contrastive_loss
             + self.mask_weight * mask_regularization
         )
         self.latest_loss_components = {
             'bpr': ranking_loss.detach(),
             'visual_bpr': visual_loss.detach(),
             'text_bpr': text_loss.detach(),
-            'contrastive': contrastive_loss.detach(),
             'mask': mask_regularization.detach(),
             'mask_budget': budget_loss.detach(),
             'mask_binary': binary_loss.detach(),
@@ -851,8 +699,8 @@ class FREEDOM_MASKED(FREEDOM):
         was_training = self.training
         self.eval()
         representations = self._encode()
-        forward_edges = self.ui_edge_index[:, :self.num_interactions]
 
+        forward_edges = self.ui_edge_index[:, :self.num_interactions]
         masks = {}
         if self.mask_logits is not None:
             probabilities = torch.sigmoid(self.mask_logits)
@@ -902,13 +750,10 @@ class FREEDOM_MASKED(FREEDOM):
         artifacts = {
             'metadata': {
                 'model': self.__class__.__name__,
-                'architecture': 'freedom_residual_dual_ui',
                 'mask_graph_mode': self.mask_graph_mode,
                 'mask_degree_mode': self.mask_degree_mode,
                 'ui_branch_mode': self.ui_branch_mode,
                 'ui_fusion_mode': self.ui_fusion_mode,
-                'ui_gate_mode': self.ui_gate_mode,
-                'mm_gate_mode': self.mm_gate_mode,
                 'user_embedding_mode': self.user_embedding_mode,
                 'item_embedding_mode': self.item_embedding_mode,
                 'mask_keep_ratio': self.mask_keep_ratio,
@@ -916,8 +761,6 @@ class FREEDOM_MASKED(FREEDOM):
                 'dropout': self.dropout,
                 'embedding_dim': self.embedding_dim,
                 'final_embedding_dim': self.final_embedding_dim,
-                'cl_weight': self.cl_weight,
-                'cl_temperature': self.cl_temperature,
                 'num_users': self.n_users,
                 'num_items': self.n_items,
                 'num_interactions': self.num_interactions,
