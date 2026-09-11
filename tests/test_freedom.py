@@ -120,6 +120,8 @@ class FreedomTestBase(unittest.TestCase):
             'random_mask_seed': 123,
             'user_embedding_mode': 'separate',
             'item_embedding_mode': 'separate',
+            'item_input_mode': 'id',
+            'hybrid_mm_weight': 0.5,
             'ui_branch_mode': 'dual',
             'ui_fusion_mode': 'gated_sum',
             'ui_gate_mode': 'separate',
@@ -448,6 +450,37 @@ class FreedomMaskedGraphTest(FreedomTestBase):
                 representations['fused_ui_items']
                 + representations['mm_items'],
             )
+
+    def test_multimodal_and_hybrid_inputs_feed_both_graphs(self):
+        for item_input_mode in ('multimodal', 'hybrid'):
+            with self.subTest(item_input_mode=item_input_mode):
+                with tempfile.TemporaryDirectory() as root:
+                    self.write_features(root)
+                    model = self.make_model(
+                        root,
+                        item_input_mode=item_input_mode,
+                        item_embedding_mode='shared',
+                        mask_graph_mode='double_full',
+                        cl_weight=0.0,
+                        reg_weight=0.0,
+                    )
+                    representations = model._encode()
+                    expected_input = model._original_item_table()
+                    torch.testing.assert_close(
+                        representations['full_mm_items'], expected_input
+                    )
+                    torch.testing.assert_close(
+                        representations['masked_mm_items'], expected_input
+                    )
+                    self.assertEqual(
+                        tuple(representations['items'].shape), (4, 3)
+                    )
+
+                    model.calculate_loss(self.interaction()).backward()
+                    self.assertIsNotNone(model.image_trs.weight.grad)
+                    self.assertIsNotNone(model.text_trs.weight.grad)
+                    if item_input_mode == 'hybrid':
+                        self.assertIsNotNone(model.hybrid_mm_logit.grad)
 
     def test_contrastive_loss_is_between_pre_fusion_ui_views(self):
         with tempfile.TemporaryDirectory() as root:

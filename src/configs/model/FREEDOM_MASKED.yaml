@@ -30,6 +30,12 @@ hard_mask_temperature: 1.0
 # Each branch has independent user/item ID tables by default.
 user_embedding_mode: separate
 item_embedding_mode: separate
+# id: original FREEDOM item-ID input;
+# multimodal: projected visual/text input shared by U-I and I-I graphs;
+# hybrid: LayerNorm(item-ID + learned_weight * multimodal), also shared.
+# multimodal/hybrid require item_embedding_mode: shared.
+item_input_mode: id
+hybrid_mm_weight: 0.5
 # dual: FREEDOM + mask; masked_only: mask branch only.
 ui_branch_mode: dual
 # Both modes output d; gated_concat uses an explicit 2d -> d projection.

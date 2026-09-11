@@ -66,6 +66,7 @@ class _ObservedEdgeSparseMM(torch.autograd.Function):
 class FREEDOM_MASKED(FREEDOM):
     """FREEDOM whose collaborative path has original and masked views."""
 
+    ITEM_INPUT_MODES = {'id', 'multimodal', 'hybrid'}
     MASK_GRAPH_MODES = {
         'soft',
         'hard',
@@ -105,6 +106,12 @@ class FREEDOM_MASKED(FREEDOM):
         self.item_embedding_mode = str(
             _config_value(config, 'item_embedding_mode', 'separate')
         ).lower()
+        self.item_input_mode = str(
+            _config_value(config, 'item_input_mode', 'id')
+        ).lower()
+        self.hybrid_mm_weight = float(
+            _config_value(config, 'hybrid_mm_weight', 0.5)
+        )
         self.ui_branch_mode = str(
             _config_value(config, 'ui_branch_mode', 'dual')
         ).lower()
@@ -124,6 +131,7 @@ class FREEDOM_MASKED(FREEDOM):
         )
         self._validate_masked_config()
 
+        self._initialize_item_input_modules()
         self._initialize_masked_embedding_tables()
         self._initialize_fusion_modules()
         self._initialize_mask_graph()
@@ -166,6 +174,24 @@ class FREEDOM_MASKED(FREEDOM):
             raise ValueError(
                 "item_embedding_mode must be 'shared' or 'separate'."
             )
+        if self.item_input_mode not in self.ITEM_INPUT_MODES:
+            raise ValueError(
+                'Unsupported item_input_mode: {}.'.format(
+                    self.item_input_mode
+                )
+            )
+        if self.item_input_mode != 'id':
+            if self.image_embedding is None and self.text_embedding is None:
+                raise ValueError(
+                    'Multimodal item input requires image or text features.'
+                )
+            if self.item_embedding_mode != 'shared':
+                raise ValueError(
+                    "item_embedding_mode must be 'shared' when "
+                    "item_input_mode is 'multimodal' or 'hybrid'."
+                )
+        if not 0.0 < self.hybrid_mm_weight < 1.0:
+            raise ValueError('hybrid_mm_weight must be between 0 and 1.')
         if self.ui_branch_mode not in {'dual', 'masked_only'}:
             raise ValueError(
                 "ui_branch_mode must be 'dual' or 'masked_only'."
@@ -187,6 +213,34 @@ class FREEDOM_MASKED(FREEDOM):
         if self.cl_temperature <= 0.0:
             raise ValueError('cl_temperature must be positive.')
 
+    def _initialize_item_input_modules(self):
+        self.item_mm_input_projection = None
+        self.hybrid_item_norm = None
+        self.register_parameter('hybrid_mm_logit', None)
+        if self.item_input_mode == 'id':
+            return
+
+        modality_count = int(self.image_embedding is not None)
+        modality_count += int(self.text_embedding is not None)
+        input_dim = modality_count * self.feat_embed_dim
+        if input_dim == self.embedding_dim:
+            self.item_mm_input_projection = nn.Identity()
+        else:
+            self.item_mm_input_projection = nn.Linear(
+                input_dim, self.embedding_dim
+            )
+            nn.init.xavier_uniform_(self.item_mm_input_projection.weight)
+            nn.init.zeros_(self.item_mm_input_projection.bias)
+
+        if self.item_input_mode == 'hybrid':
+            initial_logit = math.log(
+                self.hybrid_mm_weight / (1.0 - self.hybrid_mm_weight)
+            )
+            self.hybrid_mm_logit = nn.Parameter(
+                torch.tensor(initial_logit, dtype=torch.float32)
+            )
+            self.hybrid_item_norm = nn.LayerNorm(self.embedding_dim)
+
     def _initialize_masked_embedding_tables(self):
         if self.user_embedding_mode == 'separate':
             self.masked_user_embedding = nn.Embedding(
@@ -203,6 +257,36 @@ class FREEDOM_MASKED(FREEDOM):
             nn.init.xavier_uniform_(self.masked_item_id_embedding.weight)
         else:
             self.masked_item_id_embedding = None
+
+    def _multimodal_item_input(self):
+        modality_inputs = []
+        if self.image_embedding is not None:
+            modality_inputs.append(
+                F.normalize(
+                    self.image_trs(self.image_embedding.weight), dim=-1
+                )
+            )
+        if self.text_embedding is not None:
+            modality_inputs.append(
+                F.normalize(
+                    self.text_trs(self.text_embedding.weight), dim=-1
+                )
+            )
+        multimodal_input = torch.cat(modality_inputs, dim=-1)
+        return self.item_mm_input_projection(multimodal_input)
+
+    def _original_item_table(self):
+        if self.item_input_mode == 'id':
+            return self.item_id_embedding.weight
+
+        multimodal_items = self._multimodal_item_input()
+        if self.item_input_mode == 'multimodal':
+            return multimodal_items
+
+        mm_weight = torch.sigmoid(self.hybrid_mm_logit)
+        return self.hybrid_item_norm(
+            self.item_id_embedding.weight + mm_weight * multimodal_items
+        )
 
     @staticmethod
     def _new_gate(embedding_dim):
@@ -601,9 +685,11 @@ class FREEDOM_MASKED(FREEDOM):
             return self.user_embedding.weight
         return self.masked_user_embedding.weight
 
-    def _masked_item_table(self):
+    def _masked_item_table(self, original_item_table):
+        if self.item_input_mode != 'id':
+            return original_item_table
         if self.masked_item_id_embedding is None:
-            return self.item_id_embedding.weight
+            return original_item_table
         return self.masked_item_id_embedding.weight
 
     def _ui_fusion_modules(self, node_type):
@@ -645,7 +731,8 @@ class FREEDOM_MASKED(FREEDOM):
 
     def _encode(self):
         masked_user_table = self._masked_user_table()
-        masked_item_table = self._masked_item_table()
+        original_item_table = self._original_item_table()
+        masked_item_table = self._masked_item_table(original_item_table)
         masked_initial = torch.cat(
             (masked_user_table, masked_item_table), dim=0
         )
@@ -677,7 +764,7 @@ class FREEDOM_MASKED(FREEDOM):
             }
 
         original_initial = torch.cat(
-            (self.user_embedding.weight, self.item_id_embedding.weight),
+            (self.user_embedding.weight, original_item_table),
             dim=0,
         )
         original_embeddings = self._propagate_ui_graph(
@@ -695,7 +782,7 @@ class FREEDOM_MASKED(FREEDOM):
         )
 
         original_mm_items = self._propagate_mm_graph(
-            self.item_id_embedding.weight
+            original_item_table
         )
         if self.item_embedding_mode == 'shared':
             masked_mm_items = original_mm_items
@@ -911,6 +998,12 @@ class FREEDOM_MASKED(FREEDOM):
                 'mm_gate_mode': self.mm_gate_mode,
                 'user_embedding_mode': self.user_embedding_mode,
                 'item_embedding_mode': self.item_embedding_mode,
+                'item_input_mode': self.item_input_mode,
+                'hybrid_mm_weight': (
+                    float(torch.sigmoid(self.hybrid_mm_logit).item())
+                    if self.hybrid_mm_logit is not None
+                    else self.hybrid_mm_weight
+                ),
                 'mask_keep_ratio': self.mask_keep_ratio,
                 'random_mask_seed': self.random_mask_seed,
                 'dropout': self.dropout,
