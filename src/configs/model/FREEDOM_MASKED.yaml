@@ -31,9 +31,11 @@ hard_mask_temperature: 1.0
 user_embedding_mode: separate
 item_embedding_mode: separate
 # id: original FREEDOM item-ID input;
-# multimodal: projected visual/text input shared by U-I and I-I graphs;
+# multimodal: concatenate modalities then project 2d -> d;
+# multimodal_concat: keep [image d | text d] at 2d in U-I and I-I;
 # hybrid: LayerNorm(item-ID + learned_weight * multimodal), also shared.
-# multimodal/hybrid require item_embedding_mode: shared.
+# All multimodal modes require item_embedding_mode: shared;
+# multimodal_concat additionally requires both image and text features.
 item_input_mode: id
 hybrid_mm_weight: 0.5
 # dual: FREEDOM + mask; masked_only: mask branch only.

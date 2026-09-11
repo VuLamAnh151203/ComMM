@@ -66,7 +66,9 @@ class _ObservedEdgeSparseMM(torch.autograd.Function):
 class FREEDOM_MASKED(FREEDOM):
     """FREEDOM whose collaborative path has original and masked views."""
 
-    ITEM_INPUT_MODES = {'id', 'multimodal', 'hybrid'}
+    ITEM_INPUT_MODES = {
+        'id', 'multimodal', 'multimodal_concat', 'hybrid'
+    }
     MASK_GRAPH_MODES = {
         'soft',
         'hard',
@@ -112,6 +114,11 @@ class FREEDOM_MASKED(FREEDOM):
         self.hybrid_mm_weight = float(
             _config_value(config, 'hybrid_mm_weight', 0.5)
         )
+        self.branch_embedding_dim = (
+            2 * self.embedding_dim
+            if self.item_input_mode == 'multimodal_concat'
+            else self.embedding_dim
+        )
         self.ui_branch_mode = str(
             _config_value(config, 'ui_branch_mode', 'dual')
         ).lower()
@@ -136,9 +143,9 @@ class FREEDOM_MASKED(FREEDOM):
         self._initialize_fusion_modules()
         self._initialize_mask_graph()
 
-        # Every final representation is d-dimensional, including concat after
-        # its explicit 2d -> d projection, so the FREEDOM residual is valid.
-        self.final_embedding_dim = self.embedding_dim
+        # U-I and I-I outputs always share a dimension, so the FREEDOM
+        # residual remains valid. multimodal_concat deliberately keeps 2d.
+        self.final_embedding_dim = self.branch_embedding_dim
         if self.image_embedding is not None:
             self.image_aux_projection = self._make_aux_projection(
                 self.final_embedding_dim
@@ -188,8 +195,14 @@ class FREEDOM_MASKED(FREEDOM):
             if self.item_embedding_mode != 'shared':
                 raise ValueError(
                     "item_embedding_mode must be 'shared' when "
-                    "item_input_mode is 'multimodal' or 'hybrid'."
+                    "item_input_mode uses multimodal features."
                 )
+        if self.item_input_mode == 'multimodal_concat' and (
+            self.image_embedding is None or self.text_embedding is None
+        ):
+            raise ValueError(
+                'multimodal_concat requires both image and text features.'
+            )
         if not 0.0 < self.hybrid_mm_weight < 1.0:
             raise ValueError('hybrid_mm_weight must be between 0 and 1.')
         if self.ui_branch_mode not in {'dual', 'masked_only'}:
@@ -215,9 +228,34 @@ class FREEDOM_MASKED(FREEDOM):
 
     def _initialize_item_input_modules(self):
         self.item_mm_input_projection = None
+        self.image_item_input_projection = None
+        self.text_item_input_projection = None
+        self.concat_user_image_embedding = None
+        self.concat_user_text_embedding = None
         self.hybrid_item_norm = None
         self.register_parameter('hybrid_mm_logit', None)
         if self.item_input_mode == 'id':
+            return
+
+        if self.item_input_mode == 'multimodal_concat':
+            self.image_item_input_projection = (
+                self._new_modality_input_projection()
+            )
+            self.text_item_input_projection = (
+                self._new_modality_input_projection()
+            )
+            self.concat_user_image_embedding = nn.Embedding(
+                self.n_users, self.embedding_dim
+            )
+            self.concat_user_text_embedding = nn.Embedding(
+                self.n_users, self.embedding_dim
+            )
+            nn.init.xavier_uniform_(
+                self.concat_user_image_embedding.weight
+            )
+            nn.init.xavier_uniform_(
+                self.concat_user_text_embedding.weight
+            )
             return
 
         modality_count = int(self.image_embedding is not None)
@@ -241,8 +279,35 @@ class FREEDOM_MASKED(FREEDOM):
             )
             self.hybrid_item_norm = nn.LayerNorm(self.embedding_dim)
 
+    def _new_modality_input_projection(self):
+        if self.feat_embed_dim == self.embedding_dim:
+            return nn.Identity()
+        projection = nn.Linear(self.feat_embed_dim, self.embedding_dim)
+        nn.init.xavier_uniform_(projection.weight)
+        nn.init.zeros_(projection.bias)
+        return projection
+
     def _initialize_masked_embedding_tables(self):
-        if self.user_embedding_mode == 'separate':
+        self.masked_user_image_embedding = None
+        self.masked_user_text_embedding = None
+        if (
+            self.item_input_mode == 'multimodal_concat'
+            and self.user_embedding_mode == 'separate'
+        ):
+            self.masked_user_embedding = None
+            self.masked_user_image_embedding = nn.Embedding(
+                self.n_users, self.embedding_dim
+            )
+            self.masked_user_text_embedding = nn.Embedding(
+                self.n_users, self.embedding_dim
+            )
+            nn.init.xavier_uniform_(
+                self.masked_user_image_embedding.weight
+            )
+            nn.init.xavier_uniform_(
+                self.masked_user_text_embedding.weight
+            )
+        elif self.user_embedding_mode == 'separate':
             self.masked_user_embedding = nn.Embedding(
                 self.n_users, self.embedding_dim
             )
@@ -261,18 +326,22 @@ class FREEDOM_MASKED(FREEDOM):
     def _multimodal_item_input(self):
         modality_inputs = []
         if self.image_embedding is not None:
-            modality_inputs.append(
-                F.normalize(
-                    self.image_trs(self.image_embedding.weight), dim=-1
-                )
+            image_input = F.normalize(
+                self.image_trs(self.image_embedding.weight), dim=-1
             )
+            if self.item_input_mode == 'multimodal_concat':
+                image_input = self.image_item_input_projection(image_input)
+            modality_inputs.append(image_input)
         if self.text_embedding is not None:
-            modality_inputs.append(
-                F.normalize(
-                    self.text_trs(self.text_embedding.weight), dim=-1
-                )
+            text_input = F.normalize(
+                self.text_trs(self.text_embedding.weight), dim=-1
             )
+            if self.item_input_mode == 'multimodal_concat':
+                text_input = self.text_item_input_projection(text_input)
+            modality_inputs.append(text_input)
         multimodal_input = torch.cat(modality_inputs, dim=-1)
+        if self.item_input_mode == 'multimodal_concat':
+            return multimodal_input
         return self.item_mm_input_projection(multimodal_input)
 
     def _original_item_table(self):
@@ -280,7 +349,7 @@ class FREEDOM_MASKED(FREEDOM):
             return self.item_id_embedding.weight
 
         multimodal_items = self._multimodal_item_input()
-        if self.item_input_mode == 'multimodal':
+        if self.item_input_mode in {'multimodal', 'multimodal_concat'}:
             return multimodal_items
 
         mm_weight = torch.sigmoid(self.hybrid_mm_logit)
@@ -315,27 +384,31 @@ class FREEDOM_MASKED(FREEDOM):
             return
 
         if self.ui_gate_mode == 'shared':
-            self.fusion_gate = self._new_gate(self.embedding_dim)
+            self.fusion_gate = self._new_gate(self.branch_embedding_dim)
             if self.ui_fusion_mode == 'gated_concat':
                 self.fusion_projection = self._new_concat_projection(
-                    self.embedding_dim
+                    self.branch_embedding_dim
                 )
         else:
-            self.user_fusion_gate = self._new_gate(self.embedding_dim)
-            self.item_fusion_gate = self._new_gate(self.embedding_dim)
+            self.user_fusion_gate = self._new_gate(
+                self.branch_embedding_dim
+            )
+            self.item_fusion_gate = self._new_gate(
+                self.branch_embedding_dim
+            )
             if self.ui_fusion_mode == 'gated_concat':
                 self.user_concat_projection = (
-                    self._new_concat_projection(self.embedding_dim)
+                    self._new_concat_projection(self.branch_embedding_dim)
                 )
                 self.item_concat_projection = (
-                    self._new_concat_projection(self.embedding_dim)
+                    self._new_concat_projection(self.branch_embedding_dim)
                 )
 
         if (
             self.item_embedding_mode == 'separate'
             and self.mm_gate_mode == 'separate'
         ):
-            self.mm_fusion_gate = self._new_gate(self.embedding_dim)
+            self.mm_fusion_gate = self._new_gate(self.branch_embedding_dim)
 
     def _initialize_mask_graph(self):
         initial_logit = math.log(
@@ -680,7 +753,28 @@ class FREEDOM_MASKED(FREEDOM):
             embeddings.append(current)
         return torch.stack(embeddings, dim=1).mean(dim=1)
 
+    def _original_user_table(self):
+        if self.item_input_mode != 'multimodal_concat':
+            return self.user_embedding.weight
+        return torch.cat(
+            (
+                self.concat_user_image_embedding.weight,
+                self.concat_user_text_embedding.weight,
+            ),
+            dim=-1,
+        )
+
     def _masked_user_table(self):
+        if self.item_input_mode == 'multimodal_concat':
+            if self.user_embedding_mode == 'shared':
+                return self._original_user_table()
+            return torch.cat(
+                (
+                    self.masked_user_image_embedding.weight,
+                    self.masked_user_text_embedding.weight,
+                ),
+                dim=-1,
+            )
         if self.masked_user_embedding is None:
             return self.user_embedding.weight
         return self.masked_user_embedding.weight
@@ -764,7 +858,7 @@ class FREEDOM_MASKED(FREEDOM):
             }
 
         original_initial = torch.cat(
-            (self.user_embedding.weight, original_item_table),
+            (self._original_user_table(), original_item_table),
             dim=0,
         )
         original_embeddings = self._propagate_ui_graph(
@@ -1008,6 +1102,7 @@ class FREEDOM_MASKED(FREEDOM):
                 'random_mask_seed': self.random_mask_seed,
                 'dropout': self.dropout,
                 'embedding_dim': self.embedding_dim,
+                'branch_embedding_dim': self.branch_embedding_dim,
                 'final_embedding_dim': self.final_embedding_dim,
                 'cl_weight': self.cl_weight,
                 'cl_temperature': self.cl_temperature,

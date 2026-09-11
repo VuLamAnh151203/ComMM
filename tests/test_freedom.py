@@ -482,6 +482,43 @@ class FreedomMaskedGraphTest(FreedomTestBase):
                     if item_input_mode == 'hybrid':
                         self.assertIsNotNone(model.hybrid_mm_logit.grad)
 
+    def test_multimodal_concat_keeps_two_modality_dimensions(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.write_features(root)
+            model = self.make_model(
+                root,
+                item_input_mode='multimodal_concat',
+                item_embedding_mode='shared',
+                user_embedding_mode='separate',
+                mask_graph_mode='double_full',
+                cl_weight=0.0,
+                reg_weight=0.0,
+            )
+            representations = model._encode()
+            self.assertEqual(model.branch_embedding_dim, 6)
+            self.assertEqual(tuple(representations['users'].shape), (3, 6))
+            self.assertEqual(tuple(representations['items'].shape), (4, 6))
+            torch.testing.assert_close(
+                representations['full_mm_items'],
+                representations['masked_mm_items'],
+            )
+
+            model.calculate_loss(self.interaction()).backward()
+            self.assertIsNotNone(
+                model.concat_user_image_embedding.weight.grad
+            )
+            self.assertIsNotNone(
+                model.concat_user_text_embedding.weight.grad
+            )
+            self.assertIsNotNone(
+                model.masked_user_image_embedding.weight.grad
+            )
+            self.assertIsNotNone(
+                model.masked_user_text_embedding.weight.grad
+            )
+            self.assertIsNotNone(model.image_trs.weight.grad)
+            self.assertIsNotNone(model.text_trs.weight.grad)
+
     def test_contrastive_loss_is_between_pre_fusion_ui_views(self):
         with tempfile.TemporaryDirectory() as root:
             self.write_features(root)

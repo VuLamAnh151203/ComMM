@@ -78,8 +78,9 @@ Implementation `FREEDOM_MASKED` cũ được giữ tại
 `src/models/freedom_masked_legacy.py`. Implementation mới giữ residual của
 FREEDOM (`I_UI + I_MM`), hỗ trợ `ui_gate_mode: shared|separate`,
 `mm_gate_mode: reuse_ui_item|separate`, và contrastive loss giữa hai U-I view.
-`item_input_mode: id|multimodal|hybrid` cho phép giữ item-ID input gốc hoặc
-dùng một multimodal/hybrid item anchor chung trong cả U-I và I-I graph.
+`item_input_mode: id|multimodal|multimodal_concat|hybrid` cho phép giữ item-ID
+input gốc, project multimodal input về `d`, hoặc giữ `[image d | text d]` ở
+dimension `2d` trong cả U-I và I-I graph.
 
 ## Kiểm thử
 
