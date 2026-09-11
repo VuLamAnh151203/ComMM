@@ -81,6 +81,8 @@ FREEDOM (`I_UI + I_MM`), hỗ trợ `ui_gate_mode: shared|separate`,
 `item_input_mode: id|multimodal|multimodal_concat|hybrid` cho phép giữ item-ID
 input gốc, project multimodal input về `d`, hoặc giữ `[image d | text d]` ở
 dimension `2d` trong cả U-I và I-I graph.
+Gate hỗ trợ `gate_init_mode: xavier|constant`; mode `constant` khởi tạo tỷ lệ
+nhánh gốc bằng `gate_initial_original_weight` trước khi MLP tiếp tục học.
 
 ## Kiểm thử
 

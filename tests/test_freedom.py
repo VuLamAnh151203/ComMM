@@ -126,6 +126,8 @@ class FreedomTestBase(unittest.TestCase):
             'ui_fusion_mode': 'gated_sum',
             'ui_gate_mode': 'separate',
             'mm_gate_mode': 'reuse_ui_item',
+            'gate_init_mode': 'xavier',
+            'gate_initial_original_weight': 0.9,
             'cl_weight': 0.5,
             'cl_temperature': 0.2,
         })
@@ -427,6 +429,26 @@ class FreedomMaskedGraphTest(FreedomTestBase):
                             self.assertIsNotNone(
                                 model.mm_fusion_gate.weight.grad
                             )
+
+    def test_constant_gate_initialization_favors_original_branch(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.write_features(root)
+            model = self.make_model(
+                root,
+                mask_graph_mode='double_full',
+                gate_init_mode='constant',
+                gate_initial_original_weight=0.9,
+            )
+            original = torch.randn(4, model.branch_embedding_dim)
+            masked = torch.randn(4, model.branch_embedding_dim)
+            _, gate = model._fuse_ui_pair(original, masked, 'item')
+
+            torch.testing.assert_close(
+                gate, torch.full_like(gate, 0.9)
+            )
+            self.assertEqual(
+                torch.count_nonzero(model.item_fusion_gate.weight).item(), 0
+            )
 
     def test_shared_item_table_uses_one_multimodal_representation(self):
         with tempfile.TemporaryDirectory() as root:

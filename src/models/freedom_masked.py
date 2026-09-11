@@ -131,6 +131,12 @@ class FREEDOM_MASKED(FREEDOM):
         self.mm_gate_mode = str(
             _config_value(config, 'mm_gate_mode', 'reuse_ui_item')
         ).lower()
+        self.gate_init_mode = str(
+            _config_value(config, 'gate_init_mode', 'xavier')
+        ).lower()
+        self.gate_initial_original_weight = float(
+            _config_value(config, 'gate_initial_original_weight', 0.9)
+        )
 
         self.cl_weight = float(_config_value(config, 'cl_weight', 0.5))
         self.cl_temperature = float(
@@ -220,6 +226,14 @@ class FREEDOM_MASKED(FREEDOM):
         if self.mm_gate_mode not in {'reuse_ui_item', 'separate'}:
             raise ValueError(
                 "mm_gate_mode must be 'reuse_ui_item' or 'separate'."
+            )
+        if self.gate_init_mode not in {'xavier', 'constant'}:
+            raise ValueError(
+                "gate_init_mode must be 'xavier' or 'constant'."
+            )
+        if not 0.0 < self.gate_initial_original_weight < 1.0:
+            raise ValueError(
+                'gate_initial_original_weight must be between 0 and 1.'
             )
         if self.cl_weight < 0.0:
             raise ValueError('cl_weight cannot be negative.')
@@ -357,11 +371,18 @@ class FREEDOM_MASKED(FREEDOM):
             self.item_id_embedding.weight + mm_weight * multimodal_items
         )
 
-    @staticmethod
-    def _new_gate(embedding_dim):
+    def _new_gate(self, embedding_dim):
         gate = nn.Linear(2 * embedding_dim, embedding_dim)
-        nn.init.xavier_uniform_(gate.weight)
-        nn.init.zeros_(gate.bias)
+        if self.gate_init_mode == 'constant':
+            initial_bias = math.log(
+                self.gate_initial_original_weight
+                / (1.0 - self.gate_initial_original_weight)
+            )
+            nn.init.zeros_(gate.weight)
+            nn.init.constant_(gate.bias, initial_bias)
+        else:
+            nn.init.xavier_uniform_(gate.weight)
+            nn.init.zeros_(gate.bias)
         return gate
 
     @staticmethod
@@ -1090,6 +1111,10 @@ class FREEDOM_MASKED(FREEDOM):
                 'ui_fusion_mode': self.ui_fusion_mode,
                 'ui_gate_mode': self.ui_gate_mode,
                 'mm_gate_mode': self.mm_gate_mode,
+                'gate_init_mode': self.gate_init_mode,
+                'gate_initial_original_weight': (
+                    self.gate_initial_original_weight
+                ),
                 'user_embedding_mode': self.user_embedding_mode,
                 'item_embedding_mode': self.item_embedding_mode,
                 'item_input_mode': self.item_input_mode,

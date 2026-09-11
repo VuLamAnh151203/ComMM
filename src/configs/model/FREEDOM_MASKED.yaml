@@ -40,10 +40,15 @@ item_input_mode: id
 hybrid_mm_weight: 0.5
 # dual: FREEDOM + mask; masked_only: mask branch only.
 ui_branch_mode: dual
-# Both modes output d; gated_concat uses an explicit 2d -> d projection.
+# Both modes preserve the branch dimension; gated_concat projects its
+# concatenated 2x input back to that dimension.
 ui_fusion_mode: gated_sum
 # shared: one gate network for both node types; separate: user/item gates.
 ui_gate_mode: separate
+# xavier: current data-dependent random initialization around 0.5;
+# constant: start every gate at gate_initial_original_weight, then learn.
+gate_init_mode: xavier
+gate_initial_original_weight: 0.9
 # reuse_ui_item: reuse the U-I item gate for I-I weighted fusion;
 # separate: learn an independent multimodal gate.
 mm_gate_mode: reuse_ui_item
