@@ -1,0 +1,36 @@
+embedding_size: 64
+feat_embed_dim: 64
+
+learning_rate_scheduler: [0.96, 50]
+learning_rate: 0.001
+reg_weight: 0.0
+
+n_mm_layers: 1
+n_ui_layers: 2
+knn_k: 10
+mm_image_weight: 0.1
+
+# Applied only to FREEDOM's degree-sensitive user-item branch.
+dropout: 0.8
+
+# Learned/static graph used by the independent masked branch.
+mask_graph_mode: hard
+mask_keep_ratio: 0.3
+# full: retain normalization from the full graph; masked: recompute degrees.
+mask_degree_mode: full
+mask_weight: 0.1
+mask_binary_weight: 0.1
+hard_mask_temperature: 1.0
+
+# Each branch has independent user/item ID tables by default.
+user_embedding_mode: separate
+item_embedding_mode: separate
+# dual: FREEDOM + mask; masked_only: mask branch only.
+ui_branch_mode: dual
+# gated_sum keeps d; gated_concat keeps 2d without a projection.
+ui_fusion_mode: gated_concat
+
+save_analysis_artifacts: True
+restore_best_model: True
+
+hyper_parameters: []
