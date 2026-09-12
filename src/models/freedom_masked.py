@@ -68,7 +68,11 @@ class FREEDOM_MASKED(FREEDOM):
     """FREEDOM whose collaborative path has original and masked views."""
 
     ITEM_INPUT_MODES = {
-        'id', 'multimodal', 'multimodal_concat', 'hybrid'
+        'id',
+        'dual_id_concat',
+        'multimodal',
+        'multimodal_concat',
+        'hybrid',
     }
     MASK_GRAPH_MODES = {
         'soft',
@@ -117,7 +121,9 @@ class FREEDOM_MASKED(FREEDOM):
         )
         self.branch_embedding_dim = (
             2 * self.embedding_dim
-            if self.item_input_mode == 'multimodal_concat'
+            if self.item_input_mode in {
+                'dual_id_concat', 'multimodal_concat'
+            }
             else self.embedding_dim
         )
         self.ui_branch_mode = str(
@@ -149,6 +155,9 @@ class FREEDOM_MASKED(FREEDOM):
         self.aux_bpr_weight = float(
             _config_value(config, 'aux_bpr_weight', 0.0)
         )
+        self.modality_aux_user_mode = str(
+            _config_value(config, 'modality_aux_user_mode', 'fused')
+        ).lower()
         self.mask_relation_mode = str(
             _config_value(config, 'mask_relation_mode', 'none')
         ).lower()
@@ -188,20 +197,25 @@ class FREEDOM_MASKED(FREEDOM):
         self._initialize_mask_relation_history()
 
         # U-I and I-I outputs always share a dimension, so the FREEDOM
-        # residual remains valid. multimodal_concat deliberately keeps 2d.
+        # residual remains valid. Both concat input modes deliberately keep 2d.
         self.final_embedding_dim = (
             2 * self.branch_embedding_dim
             if self.ui_fusion_mode == 'gloria_concat'
             and self.ui_branch_mode == 'dual'
             else self.branch_embedding_dim
         )
+        modality_aux_dim = (
+            self.final_embedding_dim
+            if self.modality_aux_user_mode == 'fused'
+            else self.branch_embedding_dim
+        )
         if self.image_embedding is not None:
             self.image_aux_projection = self._make_aux_projection(
-                self.final_embedding_dim
+                modality_aux_dim
             )
         if self.text_embedding is not None:
             self.text_aux_projection = self._make_aux_projection(
-                self.final_embedding_dim
+                modality_aux_dim
             )
         self.latest_loss_components = {}
         self.mask_relation_epoch = -1
@@ -238,7 +252,9 @@ class FREEDOM_MASKED(FREEDOM):
                     self.item_input_mode
                 )
             )
-        if self.item_input_mode != 'id':
+        if self.item_input_mode in {
+            'multimodal', 'multimodal_concat', 'hybrid'
+        }:
             if self.image_embedding is None and self.text_embedding is None:
                 raise ValueError(
                     'Multimodal item input requires image or text features.'
@@ -308,6 +324,21 @@ class FREEDOM_MASKED(FREEDOM):
             raise ValueError(
                 "aux_bpr_mode 'branches' requires ui_branch_mode 'dual'."
             )
+        if self.modality_aux_user_mode not in {
+            'fused', 'original', 'masked', 'branches'
+        }:
+            raise ValueError(
+                "modality_aux_user_mode must be 'fused', 'original', "
+                "'masked', or 'branches'."
+            )
+        if (
+            self.modality_aux_user_mode in {'original', 'branches'}
+            and self.ui_branch_mode != 'dual'
+        ):
+            raise ValueError(
+                "modality_aux_user_mode '{}' requires ui_branch_mode "
+                "'dual'.".format(self.modality_aux_user_mode)
+            )
         if self.mask_relation_mode not in {'none', 'masked_gcn'}:
             raise ValueError(
                 "mask_relation_mode must be 'none' or 'masked_gcn'."
@@ -351,9 +382,24 @@ class FREEDOM_MASKED(FREEDOM):
         self.text_item_input_projection = None
         self.concat_user_image_embedding = None
         self.concat_user_text_embedding = None
+        self.text_user_id_embedding = None
+        self.text_item_id_embedding = None
         self.hybrid_item_norm = None
         self.register_parameter('hybrid_mm_logit', None)
         if self.item_input_mode == 'id':
+            return
+
+        if self.item_input_mode == 'dual_id_concat':
+            # The inherited tables form the image-ID half. A second pair of
+            # trainable ID tables forms the text-ID half.
+            self.text_user_id_embedding = nn.Embedding(
+                self.n_users, self.embedding_dim
+            )
+            self.text_item_id_embedding = nn.Embedding(
+                self.n_items, self.embedding_dim
+            )
+            nn.init.xavier_uniform_(self.text_user_id_embedding.weight)
+            nn.init.xavier_uniform_(self.text_item_id_embedding.weight)
             return
 
         if self.item_input_mode == 'multimodal_concat':
@@ -409,6 +455,8 @@ class FREEDOM_MASKED(FREEDOM):
     def _initialize_masked_embedding_tables(self):
         self.masked_user_image_embedding = None
         self.masked_user_text_embedding = None
+        self.masked_text_user_id_embedding = None
+        self.masked_text_item_id_embedding = None
         if (
             self.item_input_mode == 'multimodal_concat'
             and self.user_embedding_mode == 'separate'
@@ -431,6 +479,13 @@ class FREEDOM_MASKED(FREEDOM):
                 self.n_users, self.embedding_dim
             )
             nn.init.xavier_uniform_(self.masked_user_embedding.weight)
+            if self.item_input_mode == 'dual_id_concat':
+                self.masked_text_user_id_embedding = nn.Embedding(
+                    self.n_users, self.embedding_dim
+                )
+                nn.init.xavier_uniform_(
+                    self.masked_text_user_id_embedding.weight
+                )
         else:
             self.masked_user_embedding = None
 
@@ -439,6 +494,13 @@ class FREEDOM_MASKED(FREEDOM):
                 self.n_items, self.embedding_dim
             )
             nn.init.xavier_uniform_(self.masked_item_id_embedding.weight)
+            if self.item_input_mode == 'dual_id_concat':
+                self.masked_text_item_id_embedding = nn.Embedding(
+                    self.n_items, self.embedding_dim
+                )
+                nn.init.xavier_uniform_(
+                    self.masked_text_item_id_embedding.weight
+                )
         else:
             self.masked_item_id_embedding = None
 
@@ -466,6 +528,11 @@ class FREEDOM_MASKED(FREEDOM):
     def _original_item_table(self):
         if self.item_input_mode == 'id':
             return self.item_id_embedding.weight
+        if self.item_input_mode == 'dual_id_concat':
+            return torch.cat((
+                self.text_item_id_embedding.weight,
+                self.item_id_embedding.weight,
+            ), dim=-1)
 
         multimodal_items = self._multimodal_item_input()
         if self.item_input_mode in {'multimodal', 'multimodal_concat'}:
@@ -910,6 +977,11 @@ class FREEDOM_MASKED(FREEDOM):
         return torch.stack(embeddings, dim=1).mean(dim=1)
 
     def _original_user_table(self):
+        if self.item_input_mode == 'dual_id_concat':
+            return torch.cat((
+                self.text_user_id_embedding.weight,
+                self.user_embedding.weight,
+            ), dim=-1)
         if self.item_input_mode != 'multimodal_concat':
             return self.user_embedding.weight
         return torch.cat(
@@ -921,6 +993,13 @@ class FREEDOM_MASKED(FREEDOM):
         )
 
     def _masked_user_table(self):
+        if self.item_input_mode == 'dual_id_concat':
+            if self.user_embedding_mode == 'shared':
+                return self._original_user_table()
+            return torch.cat((
+                self.masked_text_user_id_embedding.weight,
+                self.masked_user_embedding.weight,
+            ), dim=-1)
         if self.item_input_mode == 'multimodal_concat':
             if self.user_embedding_mode == 'shared':
                 return self._original_user_table()
@@ -936,6 +1015,13 @@ class FREEDOM_MASKED(FREEDOM):
         return self.masked_user_embedding.weight
 
     def _masked_item_table(self, original_item_table):
+        if self.item_input_mode == 'dual_id_concat':
+            if self.item_embedding_mode == 'shared':
+                return original_item_table
+            return torch.cat((
+                self.masked_text_item_id_embedding.weight,
+                self.masked_item_id_embedding.weight,
+            ), dim=-1)
         if self.item_input_mode != 'id':
             return original_item_table
         if self.masked_item_id_embedding is None:
@@ -1051,9 +1137,7 @@ class FREEDOM_MASKED(FREEDOM):
                 fused_mm_items = original_mm_items
                 mm_gate = None
             else:
-                masked_mm_items = self._propagate_mm_graph(
-                    self.masked_item_id_embedding.weight
-                )
+                masked_mm_items = self._propagate_mm_graph(masked_item_table)
                 fused_mm_items, mm_gate = self._fuse_mm_items(
                     original_mm_items, masked_mm_items, item_gate
                 )
@@ -1105,30 +1189,49 @@ class FREEDOM_MASKED(FREEDOM):
         )
         return 0.5 * (user_loss + item_loss)
 
+    def _modality_aux_user_views(self, representations):
+        if self.modality_aux_user_mode == 'fused':
+            return (representations['users'],)
+        if self.modality_aux_user_mode == 'original':
+            return (representations['full_users'],)
+        if self.modality_aux_user_mode == 'masked':
+            return (representations['masked_users'],)
+        return (
+            representations['full_users'],
+            representations['masked_users'],
+        )
+
     def _auxiliary_losses(
-        self, all_users, users, positive_items, negative_items
+        self, representations, users, positive_items, negative_items
     ):
-        zero = all_users.new_zeros(())
+        user_views = self._modality_aux_user_views(representations)
+        zero = representations['users'].new_zeros(())
         visual_loss = zero
         text_loss = zero
         if self.image_embedding is not None:
             image_features = self.image_aux_projection(
                 self.image_trs(self.image_embedding.weight)
             )
-            visual_loss = self.bpr_loss(
-                all_users[users],
-                image_features[positive_items],
-                image_features[negative_items],
-            )
+            visual_loss = torch.stack(tuple(
+                self.bpr_loss(
+                    user_view[users],
+                    image_features[positive_items],
+                    image_features[negative_items],
+                )
+                for user_view in user_views
+            )).mean()
         if self.text_embedding is not None:
             text_features = self.text_aux_projection(
                 self.text_trs(self.text_embedding.weight)
             )
-            text_loss = self.bpr_loss(
-                all_users[users],
-                text_features[positive_items],
-                text_features[negative_items],
-            )
+            text_loss = torch.stack(tuple(
+                self.bpr_loss(
+                    user_view[users],
+                    text_features[positive_items],
+                    text_features[negative_items],
+                )
+                for user_view in user_views
+            )).mean()
         return visual_loss, text_loss
 
     def _branch_bpr_losses(
@@ -1294,7 +1397,7 @@ class FREEDOM_MASKED(FREEDOM):
             all_items[negative_items],
         )
         visual_loss, text_loss = self._auxiliary_losses(
-            all_users, users, positive_items, negative_items
+            representations, users, positive_items, negative_items
         )
         contrastive_loss = self._contrastive_loss(
             representations, users, positive_items
@@ -1439,6 +1542,7 @@ class FREEDOM_MASKED(FREEDOM):
                 'cl_temperature': self.cl_temperature,
                 'aux_bpr_mode': self.aux_bpr_mode,
                 'aux_bpr_weight': self.aux_bpr_weight,
+                'modality_aux_user_mode': self.modality_aux_user_mode,
                 'mask_relation_mode': self.mask_relation_mode,
                 'mask_relation_weight': self.mask_relation_weight,
                 'mask_relation_temperature': (

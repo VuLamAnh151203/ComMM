@@ -109,6 +109,7 @@ class FreedomTestBase(unittest.TestCase):
             'n_mm_layers': 1,
             'n_ui_layers': 2,
             'reg_weight': 0.1,
+            'modality_aux_user_mode': 'fused',
             'mm_image_weight': 0.2,
             'dropout': 0.5,
             'mask_keep_ratio': 0.4,
@@ -679,6 +680,78 @@ class FreedomMaskedGraphTest(FreedomTestBase):
             self.assertIsNotNone(model.image_trs.weight.grad)
             self.assertIsNotNone(model.text_trs.weight.grad)
 
+    def test_dual_id_concat_uses_two_id_tables_at_two_dimensions(self):
+        for embedding_mode in ('shared', 'separate'):
+            with self.subTest(embedding_mode=embedding_mode):
+                with tempfile.TemporaryDirectory() as root:
+                    self.write_features(root)
+                    model = self.make_model(
+                        root,
+                        item_input_mode='dual_id_concat',
+                        user_embedding_mode=embedding_mode,
+                        item_embedding_mode=embedding_mode,
+                        mask_graph_mode='double_full',
+                        cl_weight=0.0,
+                        reg_weight=0.0,
+                    )
+
+                    expected_users = torch.cat((
+                        model.text_user_id_embedding.weight,
+                        model.user_embedding.weight,
+                    ), dim=-1)
+                    expected_items = torch.cat((
+                        model.text_item_id_embedding.weight,
+                        model.item_id_embedding.weight,
+                    ), dim=-1)
+                    torch.testing.assert_close(
+                        model._original_user_table(), expected_users
+                    )
+                    torch.testing.assert_close(
+                        model._original_item_table(), expected_items
+                    )
+                    self.assertEqual(model.branch_embedding_dim, 6)
+
+                    representations = model._encode()
+                    self.assertEqual(
+                        tuple(representations['users'].shape), (3, 6)
+                    )
+                    self.assertEqual(
+                        tuple(representations['items'].shape), (4, 6)
+                    )
+                    if embedding_mode == 'shared':
+                        torch.testing.assert_close(
+                            representations['full_mm_items'],
+                            representations['masked_mm_items'],
+                        )
+                    else:
+                        self.assertIsNotNone(
+                            model.masked_text_user_id_embedding
+                        )
+                        self.assertIsNotNone(
+                            model.masked_text_item_id_embedding
+                        )
+
+                    model.calculate_loss(self.interaction()).backward()
+                    self.assertIsNotNone(
+                        model.text_user_id_embedding.weight.grad
+                    )
+                    self.assertIsNotNone(
+                        model.text_item_id_embedding.weight.grad
+                    )
+                    if embedding_mode == 'separate':
+                        self.assertIsNotNone(
+                            model.masked_user_embedding.weight.grad
+                        )
+                        self.assertIsNotNone(
+                            model.masked_text_user_id_embedding.weight.grad
+                        )
+                        self.assertIsNotNone(
+                            model.masked_item_id_embedding.weight.grad
+                        )
+                        self.assertIsNotNone(
+                            model.masked_text_item_id_embedding.weight.grad
+                        )
+
     def test_contrastive_loss_is_between_pre_fusion_ui_views(self):
         with tempfile.TemporaryDirectory() as root:
             self.write_features(root)
@@ -713,6 +786,73 @@ class FreedomMaskedGraphTest(FreedomTestBase):
                     self.assertTrue(torch.isfinite(loss))
                     self.assertIn('cl_weight', model.__dict__)
                     self.assertEqual(model.final_embedding_dim, 3)
+
+    def test_modality_auxiliary_user_modes(self):
+        for mode in ('fused', 'original', 'masked', 'branches'):
+            with self.subTest(mode=mode):
+                with tempfile.TemporaryDirectory() as root:
+                    self.write_features(root)
+                    model = self.make_model(
+                        root,
+                        mask_graph_mode='double_full',
+                        ui_fusion_mode='gloria_concat',
+                        modality_aux_user_mode=mode,
+                        aux_bpr_mode='none',
+                        cl_weight=0.0,
+                        mask_weight=0.0,
+                    )
+                    users, positive_items, negative_items = (
+                        self.interaction()
+                    )
+                    representations = model._encode()
+                    visual_loss, text_loss = model._auxiliary_losses(
+                        representations,
+                        users,
+                        positive_items,
+                        negative_items,
+                    )
+
+                    if mode == 'fused':
+                        user_views = (representations['users'],)
+                    elif mode == 'original':
+                        user_views = (representations['full_users'],)
+                    elif mode == 'masked':
+                        user_views = (representations['masked_users'],)
+                    else:
+                        user_views = (
+                            representations['full_users'],
+                            representations['masked_users'],
+                        )
+
+                    image_features = model.image_aux_projection(
+                        model.image_trs(model.image_embedding.weight)
+                    )
+                    text_features = model.text_aux_projection(
+                        model.text_trs(model.text_embedding.weight)
+                    )
+                    expected_visual = torch.stack(tuple(
+                        model.bpr_loss(
+                            view[users],
+                            image_features[positive_items],
+                            image_features[negative_items],
+                        )
+                        for view in user_views
+                    )).mean()
+                    expected_text = torch.stack(tuple(
+                        model.bpr_loss(
+                            view[users],
+                            text_features[positive_items],
+                            text_features[negative_items],
+                        )
+                        for view in user_views
+                    )).mean()
+                    torch.testing.assert_close(
+                        visual_loss, expected_visual
+                    )
+                    torch.testing.assert_close(text_loss, expected_text)
+                    self.assertTrue(torch.isfinite(
+                        model.calculate_loss(self.interaction())
+                    ))
 
     def test_state_restore_artifacts_and_deterministic_inference(self):
         with tempfile.TemporaryDirectory() as root:

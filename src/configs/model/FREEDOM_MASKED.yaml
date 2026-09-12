@@ -3,7 +3,10 @@ feat_embed_dim: 64
 
 learning_rate_scheduler: [0.96, 50]
 learning_rate: 0.001
-reg_weight: 0.003
+reg_weight: 1.0
+# fused: current behavior; original: FREEDOM-compatible U-I users;
+# masked: masked U-I users; branches: mean auxiliary loss of both U-I views.
+modality_aux_user_mode: fused
 cl_weight: 0.0
 cl_temperature: 0.2
 # none: only BPR on the fused output; branches: additionally supervise each
@@ -22,12 +25,12 @@ dropout: 0.8
 # Learned/static graph used by the independent masked branch.
 # Also supports random_fixed and random_dynamic non-learnable masks.
 # Set dropout: 0.0 for a strict Full + Random Mask experiment.
-mask_graph_mode: soft
+mask_graph_mode: hard
 mask_keep_ratio: 0.3
 random_mask_seed: 999
 # full: retain normalization from the full graph; masked: recompute degrees.
 mask_degree_mode: full
-mask_weight: 0.0
+mask_weight: 0.1
 mask_binary_weight: 0.1
 hard_mask_temperature: 1.0
 
