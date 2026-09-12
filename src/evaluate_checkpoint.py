@@ -99,7 +99,13 @@ def evaluate_checkpoint(args):
     logger.info(config)
 
     dataset = RecDataset(config)
-    train_dataset, _, test_dataset = dataset.split()
+    train_dataset, valid_dataset, test_dataset = dataset.split()
+    # RecDataset currently initializes ``inter_num`` while formatting its
+    # statistics; DataLoader expects that attribute to exist.
+    logger.info(str(dataset))
+    logger.info('\n====Training====\n%s', train_dataset)
+    logger.info('\n====Validation====\n%s', valid_dataset)
+    logger.info('\n====Testing====\n%s', test_dataset)
     train_data = TrainDataLoader(
         config,
         train_dataset,
