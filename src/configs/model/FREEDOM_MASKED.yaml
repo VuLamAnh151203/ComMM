@@ -3,7 +3,7 @@ feat_embed_dim: 64
 
 learning_rate_scheduler: [0.96, 50]
 learning_rate: 0.001
-reg_weight: 0.0
+reg_weight: 0.001
 cl_weight: 0.0
 cl_temperature: 0.2
 # none: only BPR on the fused output; branches: additionally supervise each
@@ -23,13 +23,29 @@ dropout: 0.8
 # Also supports random_fixed and random_dynamic non-learnable masks.
 # Set dropout: 0.0 for a strict Full + Random Mask experiment.
 mask_graph_mode: hard
-mask_keep_ratio: 0.5
+mask_keep_ratio: 0.3
 random_mask_seed: 999
 # full: retain normalization from the full graph; masked: recompute degrees.
 mask_degree_mode: full
-mask_weight: 0.0
+mask_weight: 0.1
 mask_binary_weight: 0.1
 hard_mask_temperature: 1.0
+
+# none: disabled; masked_gcn: order each user's train-history edge mask by
+# cosine relevance to the mean masked U-I GCN item representation.
+# The ordering target is detached and the pairwise loss optimizes mask logits.
+mask_relation_mode: none
+mask_relation_weight: 0.05
+mask_relation_temperature: 1.0
+mask_relation_pairs_per_user: 32
+mask_relation_min_history: 2
+mask_relation_min_relevance_gap: 0.05
+mask_relation_user_ratio: 1.0
+# 0 means no cap among the unique users in the current training batch.
+mask_relation_max_users: 0
+# Linearly scale the relation loss during its first N epochs; 0 disables it.
+mask_relation_warmup_epochs: 10
+mask_relation_seed: 20000
 
 # Each branch has independent user/item ID tables by default.
 user_embedding_mode: separate

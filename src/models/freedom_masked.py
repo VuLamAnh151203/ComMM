@@ -8,6 +8,7 @@ combined by a weighted sum.
 """
 
 import math
+import random
 
 import numpy as np
 import scipy.sparse as sp
@@ -148,12 +149,43 @@ class FREEDOM_MASKED(FREEDOM):
         self.aux_bpr_weight = float(
             _config_value(config, 'aux_bpr_weight', 0.0)
         )
+        self.mask_relation_mode = str(
+            _config_value(config, 'mask_relation_mode', 'none')
+        ).lower()
+        self.mask_relation_weight = float(
+            _config_value(config, 'mask_relation_weight', 0.0)
+        )
+        self.mask_relation_temperature = float(
+            _config_value(config, 'mask_relation_temperature', 1.0)
+        )
+        self.mask_relation_pairs_per_user = int(
+            _config_value(config, 'mask_relation_pairs_per_user', 32)
+        )
+        self.mask_relation_min_history = int(
+            _config_value(config, 'mask_relation_min_history', 2)
+        )
+        self.mask_relation_min_relevance_gap = float(
+            _config_value(config, 'mask_relation_min_relevance_gap', 0.05)
+        )
+        self.mask_relation_user_ratio = float(
+            _config_value(config, 'mask_relation_user_ratio', 1.0)
+        )
+        self.mask_relation_max_users = int(
+            _config_value(config, 'mask_relation_max_users', 0)
+        )
+        self.mask_relation_warmup_epochs = int(
+            _config_value(config, 'mask_relation_warmup_epochs', 0)
+        )
+        self.mask_relation_seed = int(
+            _config_value(config, 'mask_relation_seed', 20000)
+        )
         self._validate_masked_config()
 
         self._initialize_item_input_modules()
         self._initialize_masked_embedding_tables()
         self._initialize_fusion_modules()
         self._initialize_mask_graph()
+        self._initialize_mask_relation_history()
 
         # U-I and I-I outputs always share a dimension, so the FREEDOM
         # residual remains valid. multimodal_concat deliberately keeps 2d.
@@ -172,6 +204,8 @@ class FREEDOM_MASKED(FREEDOM):
                 self.final_embedding_dim
             )
         self.latest_loss_components = {}
+        self.mask_relation_epoch = -1
+        self._mask_relation_rng = random.Random(self.mask_relation_seed)
 
     def _validate_masked_config(self):
         if not 0.0 < self.mask_keep_ratio < 1.0:
@@ -273,6 +307,42 @@ class FREEDOM_MASKED(FREEDOM):
         ):
             raise ValueError(
                 "aux_bpr_mode 'branches' requires ui_branch_mode 'dual'."
+            )
+        if self.mask_relation_mode not in {'none', 'masked_gcn'}:
+            raise ValueError(
+                "mask_relation_mode must be 'none' or 'masked_gcn'."
+            )
+        if self.mask_relation_weight < 0.0:
+            raise ValueError('mask_relation_weight cannot be negative.')
+        if self.mask_relation_temperature <= 0.0:
+            raise ValueError('mask_relation_temperature must be positive.')
+        if self.mask_relation_pairs_per_user <= 0:
+            raise ValueError(
+                'mask_relation_pairs_per_user must be positive.'
+            )
+        if self.mask_relation_min_history < 2:
+            raise ValueError('mask_relation_min_history must be at least 2.')
+        if self.mask_relation_min_relevance_gap < 0.0:
+            raise ValueError(
+                'mask_relation_min_relevance_gap cannot be negative.'
+            )
+        if not 0.0 < self.mask_relation_user_ratio <= 1.0:
+            raise ValueError(
+                'mask_relation_user_ratio must be in (0, 1].'
+            )
+        if self.mask_relation_max_users < 0:
+            raise ValueError('mask_relation_max_users cannot be negative.')
+        if self.mask_relation_warmup_epochs < 0:
+            raise ValueError(
+                'mask_relation_warmup_epochs cannot be negative.'
+            )
+        if (
+            self.mask_relation_mode != 'none'
+            and self.mask_relation_weight > 0.0
+            and self.mask_graph_mode not in {'soft', 'hard'}
+        ):
+            raise ValueError(
+                'Mask relation loss requires a learnable soft or hard mask.'
             )
 
     def _initialize_item_input_modules(self):
@@ -526,6 +596,30 @@ class FREEDOM_MASKED(FREEDOM):
         elif self.mask_graph_mode == 'local_prunning':
             self.local_pruned_adj = self._sample_local_pruned_adjacency()
 
+    def _initialize_mask_relation_history(self):
+        """Index every training-history edge by user without Python lists."""
+        forward_edges = self.ui_edge_index[:, :self.num_interactions]
+        forward_users = forward_edges[0]
+        history_order = torch.argsort(forward_users)
+        user_counts = torch.bincount(
+            forward_users, minlength=self.n_users
+        )
+        history_ptr = torch.cat((
+            user_counts.new_zeros(1),
+            torch.cumsum(user_counts, dim=0),
+        ))
+        self.register_buffer(
+            'mask_relation_history_order', history_order, persistent=False
+        )
+        self.register_buffer(
+            'mask_relation_history_ptr', history_ptr, persistent=False
+        )
+        self.register_buffer(
+            'mask_relation_forward_items',
+            forward_edges[1] - self.n_users,
+            persistent=False,
+        )
+
     def _svd_subgraph_extraction(self, adjacency):
         adjacency = adjacency.coalesce().cpu()
         indices = adjacency.indices().numpy()
@@ -677,6 +771,10 @@ class FREEDOM_MASKED(FREEDOM):
         ).indices
 
     def pre_epoch_processing(self):
+        self.mask_relation_epoch += 1
+        self._mask_relation_rng.seed(
+            self.mask_relation_seed + self.mask_relation_epoch
+        )
         self._resample_freedom_adjacency()
         if self.mask_graph_mode == 'hard':
             self.hard_train_indices = self._sample_hard_train_indices(
@@ -1075,6 +1173,115 @@ class FREEDOM_MASKED(FREEDOM):
         )
         return regularization, budget_loss, binary_loss, mask_mean
 
+    def _sample_relation_users(self, users):
+        unique_users = torch.unique(users.detach()).cpu().tolist()
+        sample_count = max(
+            1, int(math.ceil(
+                len(unique_users) * self.mask_relation_user_ratio
+            ))
+        )
+        if self.mask_relation_max_users > 0:
+            sample_count = min(sample_count, self.mask_relation_max_users)
+        if sample_count < len(unique_users):
+            unique_users = self._mask_relation_rng.sample(
+                unique_users, sample_count
+            )
+        return unique_users
+
+    def _sample_relation_pairs(self, history_size):
+        total_pairs = history_size * (history_size - 1) // 2
+        target_count = min(
+            total_pairs, self.mask_relation_pairs_per_user
+        )
+        if target_count == total_pairs:
+            return [
+                (left, right)
+                for left in range(history_size)
+                for right in range(left + 1, history_size)
+            ]
+
+        pairs = set()
+        while len(pairs) < target_count:
+            left = self._mask_relation_rng.randrange(history_size)
+            right = self._mask_relation_rng.randrange(history_size - 1)
+            if right >= left:
+                right += 1
+            if left > right:
+                left, right = right, left
+            pairs.add((left, right))
+        return list(pairs)
+
+    def _mask_relation_loss(self, representations, users, reference_loss):
+        """Rank a user's edge logits by masked-GCN history relevance.
+
+        Relevance is detached deliberately: it acts as a per-step teacher, so
+        this auxiliary objective updates the edge mask rather than changing
+        item representations to make its own targets easier.
+        """
+        zero = reference_loss.new_zeros(())
+        if (
+            self.mask_relation_mode == 'none'
+            or self.mask_relation_weight == 0.0
+        ):
+            return zero, 0, zero
+
+        masked_items = representations['masked_items'].detach()
+        user_losses = []
+        accepted_pairs = 0
+        relevance_gaps = []
+        for user_id in self._sample_relation_users(users):
+            start = int(self.mask_relation_history_ptr[user_id].item())
+            end = int(self.mask_relation_history_ptr[user_id + 1].item())
+            if end - start < self.mask_relation_min_history:
+                continue
+
+            edge_ids = self.mask_relation_history_order[start:end]
+            item_ids = self.mask_relation_forward_items[edge_ids]
+            history_items = masked_items.index_select(0, item_ids)
+            preference = history_items.mean(dim=0, keepdim=True)
+            relevance = F.cosine_similarity(
+                history_items,
+                preference.expand_as(history_items),
+                dim=-1,
+            ).detach()
+
+            pair_losses = []
+            for left, right in self._sample_relation_pairs(end - start):
+                relevance_gap = relevance[left] - relevance[right]
+                if (
+                    relevance_gap.abs().item()
+                    <= self.mask_relation_min_relevance_gap
+                ):
+                    continue
+                direction = relevance_gap.sign()
+                mask_gap = (
+                    self.mask_logits[edge_ids[left]]
+                    - self.mask_logits[edge_ids[right]]
+                )
+                pair_losses.append(F.softplus(
+                    -self.mask_relation_temperature
+                    * direction
+                    * mask_gap
+                ))
+                relevance_gaps.append(relevance_gap.abs())
+                accepted_pairs += 1
+            if pair_losses:
+                # Give each user equal weight regardless of history length.
+                user_losses.append(torch.stack(pair_losses).mean())
+
+        if not user_losses:
+            return zero, 0, zero
+        relation_loss = torch.stack(user_losses).mean()
+        mean_gap = torch.stack(relevance_gaps).mean()
+        if self.mask_relation_warmup_epochs > 0:
+            epoch = max(self.mask_relation_epoch, 0)
+            warmup = min(
+                1.0,
+                float(epoch + 1) / self.mask_relation_warmup_epochs,
+            )
+            relation_loss = relation_loss * warmup
+        return relation_loss, accepted_pairs, mean_gap
+
     def calculate_loss(self, interaction):
         users, positive_items, negative_items = interaction[:3]
         representations = self._encode()
@@ -1107,6 +1314,13 @@ class FREEDOM_MASKED(FREEDOM):
         ) = self._mask_regularization(
             representations['mask'], ranking_loss
         )
+        (
+            mask_relation_loss,
+            mask_relation_pairs,
+            mask_relation_gap,
+        ) = self._mask_relation_loss(
+            representations, users, ranking_loss
+        )
 
         total_loss = (
             ranking_loss
@@ -1114,6 +1328,7 @@ class FREEDOM_MASKED(FREEDOM):
             + self.reg_weight * (visual_loss + text_loss)
             + self.cl_weight * contrastive_loss
             + self.mask_weight * mask_regularization
+            + self.mask_relation_weight * mask_relation_loss
         )
         self.latest_loss_components = {
             'bpr': ranking_loss.detach(),
@@ -1127,6 +1342,9 @@ class FREEDOM_MASKED(FREEDOM):
             'mask_budget': budget_loss.detach(),
             'mask_binary': binary_loss.detach(),
             'mask_mean': mask_mean.detach(),
+            'mask_relation': mask_relation_loss.detach(),
+            'mask_relation_pairs': mask_relation_pairs,
+            'mask_relation_mean_gap': mask_relation_gap.detach(),
         }
         return total_loss
 
@@ -1221,6 +1439,12 @@ class FREEDOM_MASKED(FREEDOM):
                 'cl_temperature': self.cl_temperature,
                 'aux_bpr_mode': self.aux_bpr_mode,
                 'aux_bpr_weight': self.aux_bpr_weight,
+                'mask_relation_mode': self.mask_relation_mode,
+                'mask_relation_weight': self.mask_relation_weight,
+                'mask_relation_temperature': (
+                    self.mask_relation_temperature
+                ),
+                'mask_relation_epoch': self.mask_relation_epoch,
                 'num_users': self.n_users,
                 'num_items': self.n_items,
                 'num_interactions': self.num_interactions,

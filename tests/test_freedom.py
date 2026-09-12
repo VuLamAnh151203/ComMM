@@ -132,6 +132,16 @@ class FreedomTestBase(unittest.TestCase):
             'cl_temperature': 0.2,
             'aux_bpr_mode': 'none',
             'aux_bpr_weight': 0.0,
+            'mask_relation_mode': 'none',
+            'mask_relation_weight': 0.0,
+            'mask_relation_temperature': 1.0,
+            'mask_relation_pairs_per_user': 32,
+            'mask_relation_min_history': 2,
+            'mask_relation_min_relevance_gap': 0.05,
+            'mask_relation_user_ratio': 1.0,
+            'mask_relation_max_users': 0,
+            'mask_relation_warmup_epochs': 0,
+            'mask_relation_seed': 20000,
         })
         config.update(overrides)
         return config
@@ -249,6 +259,48 @@ class FreedomMaskedGraphTest(FreedomTestBase):
                             eval_adjacency.to_dense(),
                             model.norm_adj.to_dense(),
                         )
+
+    def test_mask_relation_loss_orders_logits_from_masked_gcn(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.write_features(root)
+            model = self.make_model(
+                root,
+                mask_graph_mode='soft',
+                mask_relation_mode='masked_gcn',
+                mask_relation_weight=0.2,
+                mask_relation_min_relevance_gap=0.0,
+                mask_relation_pairs_per_user=1,
+            )
+            with torch.no_grad():
+                model.mask_logits.zero_()
+
+            masked_items = torch.tensor([
+                [2.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+                [1.0, 0.0, 1.0],
+            ])
+            relation_loss, pair_count, _ = model._mask_relation_loss(
+                {'masked_items': masked_items},
+                torch.tensor([0]),
+                model.mask_logits.new_zeros(()),
+            )
+            relation_loss.backward()
+
+            start = int(model.mask_relation_history_ptr[0])
+            end = int(model.mask_relation_history_ptr[1])
+            edge_ids = model.mask_relation_history_order[start:end]
+            item_ids = model.mask_relation_forward_items[edge_ids]
+            edge_for_item_0 = edge_ids[item_ids == 0].item()
+            edge_for_item_1 = edge_ids[item_ids == 1].item()
+            self.assertEqual(pair_count, 1)
+            self.assertLess(model.mask_logits.grad[edge_for_item_0], 0)
+            self.assertGreater(model.mask_logits.grad[edge_for_item_1], 0)
+
+            model.zero_grad(set_to_none=True)
+            total_loss = model.calculate_loss(self.interaction())
+            self.assertTrue(torch.isfinite(total_loss))
+            self.assertIn('mask_relation', model.latest_loss_components)
 
     def test_fixed_and_dynamic_random_masks(self):
         for graph_mode in ('random_fixed', 'random_dynamic'):
