@@ -83,6 +83,10 @@ input gốc, project multimodal input về `d`, hoặc giữ `[image d | text d]
 dimension `2d` trong cả U-I và I-I graph.
 Gate hỗ trợ `gate_init_mode: xavier|constant`; mode `constant` khởi tạo tỷ lệ
 nhánh gốc bằng `gate_initial_original_weight` trước khi MLP tiếp tục học.
+`ui_fusion_mode: gloria_concat` concatenate trực tiếp hai U-I view, giữ output
+`2d` không gate/projection; hai branch vẫn giữ I-I path song song của FREEDOM.
+`aux_bpr_mode: branches` thêm BPR riêng cho original/masked branch sau I-I
+residual; `aux_bpr_weight` điều khiển đóng góp trung bình của hai loss này.
 
 ## Kiểm thử
 

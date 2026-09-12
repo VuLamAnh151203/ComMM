@@ -130,6 +130,8 @@ class FreedomTestBase(unittest.TestCase):
             'gate_initial_original_weight': 0.9,
             'cl_weight': 0.5,
             'cl_temperature': 0.2,
+            'aux_bpr_mode': 'none',
+            'aux_bpr_weight': 0.0,
         })
         config.update(overrides)
         return config
@@ -361,6 +363,7 @@ class FreedomMaskedGraphTest(FreedomTestBase):
         cases = (
             ('dual', 'gated_sum', 3),
             ('dual', 'gated_concat', 3),
+            ('dual', 'gloria_concat', 6),
             ('masked_only', 'gated_sum', 3),
         )
         for branch_mode, fusion_mode, expected_dim in cases:
@@ -379,6 +382,89 @@ class FreedomMaskedGraphTest(FreedomTestBase):
                     if branch_mode == 'dual' and fusion_mode == 'gated_concat':
                         self.assertIsNotNone(model.user_concat_projection)
                         self.assertIsNotNone(model.item_concat_projection)
+
+    def test_gloria_concat_has_no_gate_and_parallel_freedom_paths(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.write_features(root)
+            model = self.make_model(
+                root,
+                mask_graph_mode='double_full',
+                user_embedding_mode='separate',
+                item_embedding_mode='separate',
+                ui_fusion_mode='gloria_concat',
+                cl_weight=0.0,
+            )
+            representations = model._encode()
+
+            self.assertIsNone(model.user_fusion_gate)
+            self.assertIsNone(model.item_fusion_gate)
+            self.assertIsNone(representations['user_gate'])
+            self.assertIsNone(representations['item_gate'])
+            self.assertEqual(tuple(representations['users'].shape), (3, 6))
+            self.assertEqual(tuple(representations['items'].shape), (4, 6))
+            torch.testing.assert_close(
+                representations['items'],
+                torch.cat(
+                    (
+                        representations['full_items']
+                        + representations['full_mm_items'],
+                        representations['masked_items']
+                        + representations['masked_mm_items'],
+                    ),
+                    dim=-1,
+                ),
+            )
+
+    def test_branch_auxiliary_bpr_supervises_complete_branches(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.write_features(root)
+            model = self.make_model(
+                root,
+                mask_graph_mode='double_full',
+                ui_fusion_mode='gloria_concat',
+                aux_bpr_mode='branches',
+                aux_bpr_weight=0.2,
+                reg_weight=0.0,
+                cl_weight=0.0,
+                mask_weight=0.0,
+            )
+            users, positive_items, negative_items = self.interaction()
+            representations = model._encode()
+            original_items = (
+                representations['full_items']
+                + representations['full_mm_items']
+            )
+            masked_items = (
+                representations['masked_items']
+                + representations['masked_mm_items']
+            )
+            original_loss = model.bpr_loss(
+                representations['full_users'][users],
+                original_items[positive_items],
+                original_items[negative_items],
+            )
+            masked_loss = model.bpr_loss(
+                representations['masked_users'][users],
+                masked_items[positive_items],
+                masked_items[negative_items],
+            )
+            ranking_loss = model.bpr_loss(
+                representations['users'][users],
+                representations['items'][positive_items],
+                representations['items'][negative_items],
+            )
+
+            actual = model.calculate_loss(self.interaction())
+            expected_aux = 0.5 * (original_loss + masked_loss)
+            torch.testing.assert_close(
+                actual, ranking_loss + 0.2 * expected_aux
+            )
+            torch.testing.assert_close(
+                model.latest_loss_components['aux_bpr'], expected_aux
+            )
+            actual.backward()
+            self.assertIsNotNone(model.user_embedding.weight.grad)
+            self.assertIsNotNone(model.masked_user_embedding.weight.grad)
 
     def test_ui_and_multimodal_gate_mode_matrix(self):
         for ui_gate_mode in ('shared', 'separate'):

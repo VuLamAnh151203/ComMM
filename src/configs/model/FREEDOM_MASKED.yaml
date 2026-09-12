@@ -4,8 +4,12 @@ feat_embed_dim: 64
 learning_rate_scheduler: [0.96, 50]
 learning_rate: 0.001
 reg_weight: 0.0
-cl_weight: 0.5
+cl_weight: 0.0
 cl_temperature: 0.2
+# none: only BPR on the fused output; branches: additionally supervise each
+# complete original/masked FREEDOM branch after its parallel I-I residual.
+aux_bpr_mode: none
+aux_bpr_weight: 0.1
 
 n_mm_layers: 1
 n_ui_layers: 2
@@ -19,11 +23,11 @@ dropout: 0.8
 # Also supports random_fixed and random_dynamic non-learnable masks.
 # Set dropout: 0.0 for a strict Full + Random Mask experiment.
 mask_graph_mode: hard
-mask_keep_ratio: 0.3
+mask_keep_ratio: 0.5
 random_mask_seed: 999
 # full: retain normalization from the full graph; masked: recompute degrees.
 mask_degree_mode: full
-mask_weight: 0.1
+mask_weight: 0.0
 mask_binary_weight: 0.1
 hard_mask_temperature: 1.0
 
@@ -40,8 +44,9 @@ item_input_mode: id
 hybrid_mm_weight: 0.5
 # dual: FREEDOM + mask; masked_only: mask branch only.
 ui_branch_mode: dual
-# Both modes preserve the branch dimension; gated_concat projects its
-# concatenated 2x input back to that dimension.
+# gated_sum: learned weighted sum; gated_concat: gated 2x input projected
+# back to branch dimension; gloria_concat: direct [original | masked], no
+# gate/projection, output 2x; each branch keeps its parallel FREEDOM I-I path.
 ui_fusion_mode: gated_sum
 # shared: one gate network for both node types; separate: user/item gates.
 ui_gate_mode: separate

@@ -142,6 +142,12 @@ class FREEDOM_MASKED(FREEDOM):
         self.cl_temperature = float(
             _config_value(config, 'cl_temperature', 0.2)
         )
+        self.aux_bpr_mode = str(
+            _config_value(config, 'aux_bpr_mode', 'none')
+        ).lower()
+        self.aux_bpr_weight = float(
+            _config_value(config, 'aux_bpr_weight', 0.0)
+        )
         self._validate_masked_config()
 
         self._initialize_item_input_modules()
@@ -151,7 +157,12 @@ class FREEDOM_MASKED(FREEDOM):
 
         # U-I and I-I outputs always share a dimension, so the FREEDOM
         # residual remains valid. multimodal_concat deliberately keeps 2d.
-        self.final_embedding_dim = self.branch_embedding_dim
+        self.final_embedding_dim = (
+            2 * self.branch_embedding_dim
+            if self.ui_fusion_mode == 'gloria_concat'
+            and self.ui_branch_mode == 'dual'
+            else self.branch_embedding_dim
+        )
         if self.image_embedding is not None:
             self.image_aux_projection = self._make_aux_projection(
                 self.final_embedding_dim
@@ -215,9 +226,20 @@ class FREEDOM_MASKED(FREEDOM):
             raise ValueError(
                 "ui_branch_mode must be 'dual' or 'masked_only'."
             )
-        if self.ui_fusion_mode not in {'gated_sum', 'gated_concat'}:
+        if self.ui_fusion_mode not in {
+            'gated_sum', 'gated_concat', 'gloria_concat'
+        }:
             raise ValueError(
-                "ui_fusion_mode must be 'gated_sum' or 'gated_concat'."
+                "ui_fusion_mode must be 'gated_sum', 'gated_concat', "
+                "or 'gloria_concat'."
+            )
+        if (
+            self.ui_fusion_mode == 'gloria_concat'
+            and self.ui_branch_mode != 'dual'
+        ):
+            raise ValueError(
+                "ui_fusion_mode 'gloria_concat' requires "
+                "ui_branch_mode 'dual'."
             )
         if self.ui_gate_mode not in {'shared', 'separate'}:
             raise ValueError(
@@ -239,6 +261,19 @@ class FREEDOM_MASKED(FREEDOM):
             raise ValueError('cl_weight cannot be negative.')
         if self.cl_temperature <= 0.0:
             raise ValueError('cl_temperature must be positive.')
+        if self.aux_bpr_mode not in {'none', 'branches'}:
+            raise ValueError(
+                "aux_bpr_mode must be 'none' or 'branches'."
+            )
+        if self.aux_bpr_weight < 0.0:
+            raise ValueError('aux_bpr_weight cannot be negative.')
+        if (
+            self.aux_bpr_mode == 'branches'
+            and self.ui_branch_mode != 'dual'
+        ):
+            raise ValueError(
+                "aux_bpr_mode 'branches' requires ui_branch_mode 'dual'."
+            )
 
     def _initialize_item_input_modules(self):
         self.item_mm_input_projection = None
@@ -402,6 +437,8 @@ class FREEDOM_MASKED(FREEDOM):
         self.mm_fusion_gate = None
 
         if self.ui_branch_mode != 'dual':
+            return
+        if self.ui_fusion_mode == 'gloria_concat':
             return
 
         if self.ui_gate_mode == 'shared':
@@ -815,6 +852,8 @@ class FREEDOM_MASKED(FREEDOM):
         return self.item_fusion_gate, self.item_concat_projection
 
     def _fuse_ui_pair(self, original, masked, node_type):
+        if self.ui_fusion_mode == 'gloria_concat':
+            return torch.cat((original, masked), dim=-1), None
         gate_module, projection = self._ui_fusion_modules(node_type)
         gate = torch.sigmoid(
             gate_module(torch.cat((original, masked), dim=-1))
@@ -896,20 +935,30 @@ class FREEDOM_MASKED(FREEDOM):
             original_ui_items, masked_ui_items, 'item'
         )
 
-        original_mm_items = self._propagate_mm_graph(
-            original_item_table
-        )
-        if self.item_embedding_mode == 'shared':
-            masked_mm_items = original_mm_items
-            fused_mm_items = original_mm_items
+        if self.ui_fusion_mode == 'gloria_concat':
+            original_mm_items = self._propagate_mm_graph(
+                original_item_table
+            )
+            masked_mm_items = self._propagate_mm_graph(masked_item_table)
+            fused_mm_items = torch.cat(
+                (original_mm_items, masked_mm_items), dim=-1
+            )
             mm_gate = None
         else:
-            masked_mm_items = self._propagate_mm_graph(
-                self.masked_item_id_embedding.weight
+            original_mm_items = self._propagate_mm_graph(
+                original_item_table
             )
-            fused_mm_items, mm_gate = self._fuse_mm_items(
-                original_mm_items, masked_mm_items, item_gate
-            )
+            if self.item_embedding_mode == 'shared':
+                masked_mm_items = original_mm_items
+                fused_mm_items = original_mm_items
+                mm_gate = None
+            else:
+                masked_mm_items = self._propagate_mm_graph(
+                    self.masked_item_id_embedding.weight
+                )
+                fused_mm_items, mm_gate = self._fuse_mm_items(
+                    original_mm_items, masked_mm_items, item_gate
+                )
 
         return {
             'users': fused_users,
@@ -984,6 +1033,34 @@ class FREEDOM_MASKED(FREEDOM):
             )
         return visual_loss, text_loss
 
+    def _branch_bpr_losses(
+        self, representations, users, positive_items, negative_items
+    ):
+        zero = representations['users'].new_zeros(())
+        if self.aux_bpr_mode == 'none' or self.aux_bpr_weight == 0.0:
+            return zero, zero, zero
+
+        original_items = (
+            representations['full_items']
+            + representations['full_mm_items']
+        )
+        masked_items = (
+            representations['masked_items']
+            + representations['masked_mm_items']
+        )
+        original_loss = self.bpr_loss(
+            representations['full_users'][users],
+            original_items[positive_items],
+            original_items[negative_items],
+        )
+        masked_loss = self.bpr_loss(
+            representations['masked_users'][users],
+            masked_items[positive_items],
+            masked_items[negative_items],
+        )
+        branch_loss = 0.5 * (original_loss + masked_loss)
+        return branch_loss, original_loss, masked_loss
+
     def _mask_regularization(self, probabilities, reference_loss):
         if probabilities is None:
             zero = reference_loss.new_zeros(())
@@ -1016,6 +1093,13 @@ class FREEDOM_MASKED(FREEDOM):
             representations, users, positive_items
         )
         (
+            branch_bpr_loss,
+            original_branch_bpr_loss,
+            masked_branch_bpr_loss,
+        ) = self._branch_bpr_losses(
+            representations, users, positive_items, negative_items
+        )
+        (
             mask_regularization,
             budget_loss,
             binary_loss,
@@ -1026,12 +1110,16 @@ class FREEDOM_MASKED(FREEDOM):
 
         total_loss = (
             ranking_loss
+            + self.aux_bpr_weight * branch_bpr_loss
             + self.reg_weight * (visual_loss + text_loss)
             + self.cl_weight * contrastive_loss
             + self.mask_weight * mask_regularization
         )
         self.latest_loss_components = {
             'bpr': ranking_loss.detach(),
+            'aux_bpr': branch_bpr_loss.detach(),
+            'original_branch_bpr': original_branch_bpr_loss.detach(),
+            'masked_branch_bpr': masked_branch_bpr_loss.detach(),
             'visual_bpr': visual_loss.detach(),
             'text_bpr': text_loss.detach(),
             'contrastive': contrastive_loss.detach(),
@@ -1131,6 +1219,8 @@ class FREEDOM_MASKED(FREEDOM):
                 'final_embedding_dim': self.final_embedding_dim,
                 'cl_weight': self.cl_weight,
                 'cl_temperature': self.cl_temperature,
+                'aux_bpr_mode': self.aux_bpr_mode,
+                'aux_bpr_weight': self.aux_bpr_weight,
                 'num_users': self.n_users,
                 'num_items': self.n_items,
                 'num_interactions': self.num_interactions,
