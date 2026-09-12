@@ -44,12 +44,12 @@ mask_relation_user_ratio: 1.0
 # 0 means no cap among the unique users in the current training batch.
 mask_relation_max_users: 0
 # Linearly scale the relation loss during its first N epochs; 0 disables it.
-mask_relation_warmup_epochs: 10
+mask_relation_warmup_epochs: 30
 mask_relation_seed: 20000
 
 # Each branch has independent user/item ID tables by default.
 user_embedding_mode: separate
-item_embedding_mode: separate
+item_embedding_mode: shared
 # id: original FREEDOM item-ID input;
 # multimodal: concatenate modalities then project 2d -> d;
 # multimodal_concat: keep [image d | text d] at 2d in U-I and I-I;

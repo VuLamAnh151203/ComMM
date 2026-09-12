@@ -431,7 +431,7 @@ class Trainer(AbstractTrainer):
 
                 if stop_flag:
                     stop_output = '+++++Finished training, best eval result in epoch %d' % \
-                                  (epoch_idx - self.cur_step * self.eval_step)
+                                  self.best_epoch
                     if verbose:
                         self.logger.info(stop_output)
                     break
