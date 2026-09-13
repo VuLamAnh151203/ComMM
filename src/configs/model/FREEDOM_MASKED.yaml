@@ -3,17 +3,16 @@ feat_embed_dim: 64
 
 learning_rate_scheduler: [0.96, 50]
 learning_rate: 0.001
-reg_weight: 1.0
+reg_weight: 0.0001
 # fused: current behavior; original: FREEDOM-compatible U-I users;
 # masked: masked U-I users; branches: mean auxiliary loss of both U-I views.
 modality_aux_user_mode: fused
-cl_weight: 0.0
+cl_weight: 0.001
 cl_temperature: 0.2
 # none: only BPR on the fused output; branches: additionally supervise each
 # complete original/masked FREEDOM branch after its parallel I-I residual.
-aux_bpr_mode: none
-aux_bpr_weight: 0.0
-
+aux_bpr_mode: branches
+aux_bpr_weight: 0.1
 n_mm_layers: 1
 n_ui_layers: 2
 knn_k: 10

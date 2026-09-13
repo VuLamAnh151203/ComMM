@@ -78,25 +78,20 @@ def early_stopping(value, best, cur_step, max_step, bigger=True):
     stop_flag = False
     update_flag = False
     if bigger:
-        if value > best:
+        if value >= best:
             cur_step = 0
             best = value
             update_flag = True
         else:
-            # Keep the latest epoch/checkpoint when validation ties the best
-            # score, while still treating the tie as no strict improvement
-            # for early-stopping patience.
-            update_flag = value == best
             cur_step += 1
             if cur_step > max_step:
                 stop_flag = True
     else:
-        if value < best:
+        if value <= best:
             cur_step = 0
             best = value
             update_flag = True
         else:
-            update_flag = value == best
             cur_step += 1
             if cur_step > max_step:
                 stop_flag = True
