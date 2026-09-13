@@ -149,6 +149,9 @@ class FREEDOM_MASKED(FREEDOM):
         self.cl_temperature = float(
             _config_value(config, 'cl_temperature', 0.2)
         )
+        self.cl_mode = str(
+            _config_value(config, 'cl_mode', 'symmetric')
+        ).lower()
         self.aux_bpr_mode = str(
             _config_value(config, 'aux_bpr_mode', 'none')
         ).lower()
@@ -311,6 +314,20 @@ class FREEDOM_MASKED(FREEDOM):
             raise ValueError('cl_weight cannot be negative.')
         if self.cl_temperature <= 0.0:
             raise ValueError('cl_temperature must be positive.')
+        if self.cl_mode not in {'symmetric', 'masked_to_full_teacher'}:
+            raise ValueError(
+                "cl_mode must be 'symmetric' or "
+                "'masked_to_full_teacher'."
+            )
+        if (
+            self.cl_mode == 'masked_to_full_teacher'
+            and self.cl_weight > 0.0
+            and self.ui_branch_mode != 'dual'
+        ):
+            raise ValueError(
+                "cl_mode 'masked_to_full_teacher' requires "
+                "ui_branch_mode 'dual'."
+            )
         if self.aux_bpr_mode not in {'none', 'branches'}:
             raise ValueError(
                 "aux_bpr_mode must be 'none' or 'branches'."
@@ -1174,19 +1191,55 @@ class FREEDOM_MASKED(FREEDOM):
             + F.cross_entropy(logits.transpose(0, 1), labels)
         )
 
+    def one_way_info_nce(self, student_view, teacher_view):
+        """Align the student to a detached teacher in one direction."""
+        student_view = F.normalize(student_view, dim=1)
+        teacher_view = F.normalize(teacher_view.detach(), dim=1)
+        logits = torch.matmul(
+            student_view, teacher_view.transpose(0, 1)
+        )
+        logits = logits / self.cl_temperature
+        labels = torch.arange(logits.size(0), device=logits.device)
+        return F.cross_entropy(logits, labels)
+
+    @torch.no_grad()
+    def _full_graph_teacher_views(self):
+        """Build original-branch teacher views on the complete U-I graph."""
+        original_initial = torch.cat(
+            (self._original_user_table(), self._original_item_table()),
+            dim=0,
+        )
+        teacher_embeddings = self._propagate_ui_graph(
+            self.norm_adj, original_initial
+        ).detach()
+        return torch.split(
+            teacher_embeddings, (self.n_users, self.n_items), dim=0
+        )
+
     def _contrastive_loss(self, representations, users, positive_items):
         if self.cl_weight == 0.0 or self.ui_branch_mode != 'dual':
             return representations['users'].new_zeros(())
         unique_users = torch.unique(users)
         unique_items = torch.unique(positive_items)
-        user_loss = self.info_nce(
-            representations['full_users'][unique_users],
-            representations['masked_users'][unique_users],
-        )
-        item_loss = self.info_nce(
-            representations['full_items'][unique_items],
-            representations['masked_items'][unique_items],
-        )
+        if self.cl_mode == 'masked_to_full_teacher':
+            teacher_users, teacher_items = self._full_graph_teacher_views()
+            user_loss = self.one_way_info_nce(
+                representations['masked_users'][unique_users],
+                teacher_users[unique_users],
+            )
+            item_loss = self.one_way_info_nce(
+                representations['masked_items'][unique_items],
+                teacher_items[unique_items],
+            )
+        else:
+            user_loss = self.info_nce(
+                representations['full_users'][unique_users],
+                representations['masked_users'][unique_users],
+            )
+            item_loss = self.info_nce(
+                representations['full_items'][unique_items],
+                representations['masked_items'][unique_items],
+            )
         return 0.5 * (user_loss + item_loss)
 
     def _modality_aux_user_views(self, representations):
@@ -1540,6 +1593,7 @@ class FREEDOM_MASKED(FREEDOM):
                 'final_embedding_dim': self.final_embedding_dim,
                 'cl_weight': self.cl_weight,
                 'cl_temperature': self.cl_temperature,
+                'cl_mode': self.cl_mode,
                 'aux_bpr_mode': self.aux_bpr_mode,
                 'aux_bpr_weight': self.aux_bpr_weight,
                 'modality_aux_user_mode': self.modality_aux_user_mode,
