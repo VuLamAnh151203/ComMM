@@ -314,19 +314,23 @@ class FREEDOM_MASKED(FREEDOM):
             raise ValueError('cl_weight cannot be negative.')
         if self.cl_temperature <= 0.0:
             raise ValueError('cl_temperature must be positive.')
-        if self.cl_mode not in {'symmetric', 'masked_to_full_teacher'}:
+        teacher_cl_modes = {
+            'masked_to_full_teacher',
+            'bidirectional_full_teacher',
+        }
+        if self.cl_mode not in {'symmetric', *teacher_cl_modes}:
             raise ValueError(
-                "cl_mode must be 'symmetric' or "
-                "'masked_to_full_teacher'."
+                "cl_mode must be 'symmetric', "
+                "'masked_to_full_teacher', or "
+                "'bidirectional_full_teacher'."
             )
         if (
-            self.cl_mode == 'masked_to_full_teacher'
+            self.cl_mode in teacher_cl_modes
             and self.cl_weight > 0.0
             and self.ui_branch_mode != 'dual'
         ):
             raise ValueError(
-                "cl_mode 'masked_to_full_teacher' requires "
-                "ui_branch_mode 'dual'."
+                "Teacher CL modes require ui_branch_mode 'dual'."
             )
         if self.aux_bpr_mode not in {'none', 'branches'}:
             raise ValueError(
@@ -1191,8 +1195,10 @@ class FREEDOM_MASKED(FREEDOM):
             + F.cross_entropy(logits.transpose(0, 1), labels)
         )
 
-    def one_way_info_nce(self, student_view, teacher_view):
-        """Align the student to a detached teacher in one direction."""
+    def teacher_info_nce(
+        self, student_view, teacher_view, bidirectional=False
+    ):
+        """Contrast with a detached teacher; only the student gets gradients."""
         student_view = F.normalize(student_view, dim=1)
         teacher_view = F.normalize(teacher_view.detach(), dim=1)
         logits = torch.matmul(
@@ -1200,7 +1206,13 @@ class FREEDOM_MASKED(FREEDOM):
         )
         logits = logits / self.cl_temperature
         labels = torch.arange(logits.size(0), device=logits.device)
-        return F.cross_entropy(logits, labels)
+        student_to_teacher = F.cross_entropy(logits, labels)
+        if not bidirectional:
+            return student_to_teacher
+        teacher_to_student = F.cross_entropy(
+            logits.transpose(0, 1), labels
+        )
+        return 0.5 * (student_to_teacher + teacher_to_student)
 
     @torch.no_grad()
     def _full_graph_teacher_views(self):
@@ -1221,15 +1233,21 @@ class FREEDOM_MASKED(FREEDOM):
             return representations['users'].new_zeros(())
         unique_users = torch.unique(users)
         unique_items = torch.unique(positive_items)
-        if self.cl_mode == 'masked_to_full_teacher':
+        if self.cl_mode in {
+            'masked_to_full_teacher',
+            'bidirectional_full_teacher',
+        }:
             teacher_users, teacher_items = self._full_graph_teacher_views()
-            user_loss = self.one_way_info_nce(
+            bidirectional = self.cl_mode == 'bidirectional_full_teacher'
+            user_loss = self.teacher_info_nce(
                 representations['masked_users'][unique_users],
                 teacher_users[unique_users],
+                bidirectional=bidirectional,
             )
-            item_loss = self.one_way_info_nce(
+            item_loss = self.teacher_info_nce(
                 representations['masked_items'][unique_items],
                 teacher_items[unique_items],
+                bidirectional=bidirectional,
             )
         else:
             user_loss = self.info_nce(

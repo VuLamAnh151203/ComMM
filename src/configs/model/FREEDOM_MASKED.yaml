@@ -3,7 +3,7 @@ feat_embed_dim: 64
 
 learning_rate_scheduler: [0.96, 50]
 learning_rate: 0.001
-reg_weight: 0.5
+reg_weight: 0.05
 # fused: current behavior; original: FREEDOM-compatible U-I users;
 # masked: masked U-I users; branches: mean auxiliary loss of both U-I views.
 modality_aux_user_mode: fused
@@ -22,13 +22,13 @@ knn_k: 10
 mm_image_weight: 0.1
 
 # Applied only to FREEDOM's degree-sensitive user-item branch.
-dropout: 0.8
+dropout: 0.0
 
 # Learned/static graph used by the independent masked branch.
 # Also supports random_fixed and random_dynamic non-learnable masks.
 # Set dropout: 0.0 for a strict Full + Random Mask experiment.
 mask_graph_mode: double_full
-mask_keep_ratio: 0.3
+mask_keep_ratio: 0.5
 random_mask_seed: 999
 # full: retain normalization from the full graph; masked: recompute degrees.
 mask_degree_mode: full

@@ -777,13 +777,13 @@ class FreedomMaskedGraphTest(FreedomTestBase):
                 0.0,
             )
 
-    def test_masked_to_full_teacher_cl_only_updates_student_view(self):
+    def test_bidirectional_full_teacher_cl_only_updates_student_view(self):
         with tempfile.TemporaryDirectory() as root:
             self.write_features(root)
             model = self.make_model(
                 root,
                 mask_graph_mode='soft',
-                cl_mode='masked_to_full_teacher',
+                cl_mode='bidirectional_full_teacher',
                 reg_weight=0.0,
                 aux_bpr_mode='none',
                 mask_weight=0.0,
