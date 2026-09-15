@@ -64,6 +64,7 @@ class PGLGraphModeTest(unittest.TestCase):
         graph_mode,
         ui_branch_mode='dual',
         ui_fusion_mode='gated_sum',
+        cl_mode='auto',
     ):
         return NullableConfig({
             'USER_ID_FIELD': 'user_id',
@@ -91,6 +92,7 @@ class PGLGraphModeTest(unittest.TestCase):
             'ui_fusion_mode': ui_fusion_mode,
             'cl_weight': 0.05,
             'cl_temperature': 0.2,
+            'cl_mode': cl_mode,
             'dropout': 0.0,
             'mask_weight': 0.0,
         })
@@ -124,10 +126,15 @@ class PGLGraphModeTest(unittest.TestCase):
         graph_mode,
         ui_branch_mode='dual',
         ui_fusion_mode='gated_sum',
+        cl_mode='auto',
     ):
         return TestablePGLMasked(
             self.make_config(
-                root, graph_mode, ui_branch_mode, ui_fusion_mode
+                root,
+                graph_mode,
+                ui_branch_mode,
+                ui_fusion_mode,
+                cl_mode,
             ),
             FakeTrainData(),
         )
@@ -227,6 +234,41 @@ class PGLGraphModeTest(unittest.TestCase):
                 ],
                 'gated_concat',
             )
+
+    def test_branch_dropout_contrastive_modes(self):
+        interaction = (
+            torch.tensor([0, 2]),
+            torch.tensor([0, 3]),
+            torch.tensor([2, 0]),
+        )
+        for cl_mode in ('branch', 'dropout', 'branch_and_dropout'):
+            with self.subTest(cl_mode=cl_mode):
+                with tempfile.TemporaryDirectory() as temporary_root:
+                    self.write_features(temporary_root)
+                    model = self.make_model(
+                        temporary_root,
+                        'double_full',
+                        cl_mode=cl_mode,
+                    )
+                    loss = model.calculate_loss(interaction)
+                    self.assertTrue(torch.isfinite(loss))
+
+                    components = model.latest_loss_components
+                    branch_loss = components['branch_contrastive']
+                    dropout_loss = components['dropout_contrastive']
+                    if cl_mode == 'branch':
+                        self.assertGreater(float(branch_loss), 0.0)
+                        self.assertEqual(float(dropout_loss), 0.0)
+                    elif cl_mode == 'dropout':
+                        self.assertEqual(float(branch_loss), 0.0)
+                        self.assertGreater(float(dropout_loss), 0.0)
+                    else:
+                        self.assertGreater(float(branch_loss), 0.0)
+                        self.assertGreater(float(dropout_loss), 0.0)
+                        torch.testing.assert_close(
+                            components['contrastive'],
+                            0.5 * (branch_loss + dropout_loss),
+                        )
 
     def test_fixed_and_dynamic_random_masks(self):
         for graph_mode in ('random_fixed', 'random_dynamic'):

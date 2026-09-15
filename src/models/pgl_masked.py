@@ -98,6 +98,9 @@ class PGL_MASKED(GeneralRecommender):
         self.cl_weight = _config_value(config, 'cl_weight', 0.05)
         self.cl_temperature = _config_value(config, 'cl_temperature', 0.2)
         self.cl_dropout = _config_value(config, 'dropout', 0.2)
+        self.cl_mode = str(
+            _config_value(config, 'cl_mode', 'auto')
+        ).lower()
         self.mask_weight = _config_value(config, 'mask_weight', 0.1)
         self.mask_keep_ratio = _config_value(config, 'mask_keep_ratio', 0.3)
         self.mask_binary_weight = _config_value(
@@ -131,6 +134,13 @@ class PGL_MASKED(GeneralRecommender):
             raise ValueError('cl_temperature must be positive.')
         if not 0.0 <= self.cl_dropout < 1.0:
             raise ValueError('dropout must be in the interval [0, 1).')
+        if self.cl_mode not in {
+            'auto', 'branch', 'dropout', 'branch_and_dropout'
+        }:
+            raise ValueError(
+                "cl_mode must be 'auto', 'branch', 'dropout', or "
+                "'branch_and_dropout'."
+            )
         if self.knn_k <= 0:
             raise ValueError('knn_k must be positive.')
         if self.mask_degree_mode not in {'full', 'masked'}:
@@ -155,6 +165,14 @@ class PGL_MASKED(GeneralRecommender):
         if self.ui_branch_mode not in {'dual', 'masked_only'}:
             raise ValueError(
                 "ui_branch_mode must be 'dual' or 'masked_only'."
+            )
+        if (
+            self.cl_weight > 0.0
+            and self.cl_mode in {'branch', 'branch_and_dropout'}
+            and self.ui_branch_mode != 'dual'
+        ):
+            raise ValueError(
+                "Branch CL modes require ui_branch_mode 'dual'."
             )
         if self.ui_fusion_mode not in {'gated_sum', 'gated_concat'}:
             raise ValueError(
@@ -885,6 +903,74 @@ class PGL_MASKED(GeneralRecommender):
         labels = torch.arange(logits.size(0), device=logits.device)
         return F.cross_entropy(logits, labels)
 
+    def _dropout_contrastive_loss(
+        self, user_embeddings, positive_embeddings
+    ):
+        """Original PGL CL on two dropout views of fused representations."""
+        user_loss = self.pgl_info_nce(
+            self.cl_dropout_layer(user_embeddings),
+            self.cl_dropout_layer(user_embeddings),
+        )
+        item_loss = self.pgl_info_nce(
+            self.cl_dropout_layer(positive_embeddings),
+            self.cl_dropout_layer(positive_embeddings),
+        )
+        return 0.5 * (user_loss + item_loss)
+
+    def _branch_contrastive_loss(
+        self, representations, users, positive_items
+    ):
+        """Symmetric CL between the full and masked pre-fusion branches."""
+        unique_users = torch.unique(users)
+        unique_items = torch.unique(positive_items)
+        user_loss = self.info_nce(
+            representations['full_users'][unique_users],
+            representations['masked_users'][unique_users],
+        )
+        item_loss = self.info_nce(
+            representations['full_items'][unique_items],
+            representations['masked_items'][unique_items],
+        )
+        return 0.5 * (user_loss + item_loss)
+
+    def _contrastive_losses(
+        self,
+        representations,
+        users,
+        positive_items,
+        user_embeddings,
+        positive_embeddings,
+        reference_loss,
+    ):
+        zero = reference_loss.new_zeros(())
+        if self.cl_weight == 0.0:
+            return zero, zero, zero
+
+        effective_mode = self.cl_mode
+        if effective_mode == 'auto':
+            effective_mode = (
+                'dropout'
+                if representations['full_users'] is None
+                else 'branch'
+            )
+
+        branch_loss = zero
+        dropout_loss = zero
+        active_losses = []
+        if effective_mode in {'branch', 'branch_and_dropout'}:
+            branch_loss = self._branch_contrastive_loss(
+                representations, users, positive_items
+            )
+            active_losses.append(branch_loss)
+        if effective_mode in {'dropout', 'branch_and_dropout'}:
+            dropout_loss = self._dropout_contrastive_loss(
+                user_embeddings, positive_embeddings
+            )
+            active_losses.append(dropout_loss)
+
+        contrastive_loss = torch.stack(active_losses).mean()
+        return contrastive_loss, branch_loss, dropout_loss
+
     def calculate_loss(self, interaction):
         users = interaction[0]
         positive_items = interaction[1]
@@ -898,30 +984,18 @@ class PGL_MASKED(GeneralRecommender):
             user_embeddings, positive_embeddings, negative_embeddings
         )
 
-        if self.cl_weight == 0.0:
-            contrastive_loss = ranking_loss.new_zeros(())
-        elif representations['full_users'] is None:
-            user_cl_loss = self.pgl_info_nce(
-                self.cl_dropout_layer(user_embeddings),
-                self.cl_dropout_layer(user_embeddings),
-            )
-            item_cl_loss = self.pgl_info_nce(
-                self.cl_dropout_layer(positive_embeddings),
-                self.cl_dropout_layer(positive_embeddings),
-            )
-            contrastive_loss = 0.5 * (user_cl_loss + item_cl_loss)
-        else:
-            unique_users = torch.unique(users)
-            unique_items = torch.unique(positive_items)
-            user_cl_loss = self.info_nce(
-                representations['full_users'][unique_users],
-                representations['masked_users'][unique_users],
-            )
-            item_cl_loss = self.info_nce(
-                representations['full_items'][unique_items],
-                representations['masked_items'][unique_items],
-            )
-            contrastive_loss = 0.5 * (user_cl_loss + item_cl_loss)
+        (
+            contrastive_loss,
+            branch_contrastive_loss,
+            dropout_contrastive_loss,
+        ) = self._contrastive_losses(
+            representations,
+            users,
+            positive_items,
+            user_embeddings,
+            positive_embeddings,
+            ranking_loss,
+        )
 
         interaction_mask = representations['mask']
         if interaction_mask is None:
@@ -947,6 +1021,8 @@ class PGL_MASKED(GeneralRecommender):
         self.latest_loss_components = {
             'bpr': ranking_loss.detach(),
             'contrastive': contrastive_loss.detach(),
+            'branch_contrastive': branch_contrastive_loss.detach(),
+            'dropout_contrastive': dropout_contrastive_loss.detach(),
             'mask': mask_loss.detach(),
             'mask_mean': mask_mean.detach(),
         }
@@ -1025,6 +1101,10 @@ class PGL_MASKED(GeneralRecommender):
                 'ui_branch_mode': self.ui_branch_mode,
                 'ui_fusion_mode': self.ui_fusion_mode,
                 'user_embedding_mode': self.user_embedding_mode,
+                'cl_mode': self.cl_mode,
+                'cl_weight': self.cl_weight,
+                'cl_temperature': self.cl_temperature,
+                'cl_dropout': self.cl_dropout,
                 'mask_keep_ratio': self.mask_keep_ratio,
                 'random_mask_seed': self.random_mask_seed,
                 'num_users': self.n_users,

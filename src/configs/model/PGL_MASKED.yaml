@@ -10,8 +10,13 @@ knn_k: 10
 mm_image_weight: 0.1
 
 # Two-branch masked user-item graph learning.
-cl_weight: 0.5
+cl_weight: 0.1
 cl_temperature: 0.2
+# auto: branch CL for dual, dropout CL for masked_only (legacy behavior);
+# branch: CL between full/masked pre-fusion U-I representations;
+# dropout: original PGL CL on two dropout views of fused representations;
+# branch_and_dropout: mean of branch CL and dropout CL.
+cl_mode: branch_and_dropout
 dropout: 0.2
 mask_weight: 0.1
 # mask_weight: 0.0
@@ -27,7 +32,6 @@ mask_degree_mode: full
 # random_fixed: one uniformly sampled mask, fixed for training and inference;
 # random_dynamic: resample uniformly each epoch, fixed seeded mask for inference.
 # Set cl_weight: 0.0 when the ablation must exclude the CL objective itself.
-# mask_graph_mode: double_full
 mask_graph_mode: hard
 # Seed for fixed/evaluation random masks. Dynamic training follows the run RNG.
 random_mask_seed: 999
