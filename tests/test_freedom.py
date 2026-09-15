@@ -805,6 +805,35 @@ class FreedomMaskedGraphTest(FreedomTestBase):
             )
             self.assertIsNotNone(model.mask_logits.grad)
 
+    def test_symmetric_full_graph_cl_updates_both_views(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.write_features(root)
+            model = self.make_model(
+                root,
+                mask_graph_mode='soft',
+                cl_mode='symmetric_full_graph',
+                dropout=0.8,
+                reg_weight=0.0,
+                aux_bpr_mode='none',
+                mask_weight=0.0,
+            )
+            model.train()
+            representations = model._encode()
+            users, positive_items, _ = self.interaction()
+            cl_loss = model._contrastive_loss(
+                representations, users, positive_items
+            )
+            self.assertTrue(torch.isfinite(cl_loss))
+            cl_loss.backward()
+
+            self.assertIsNotNone(model.user_embedding.weight.grad)
+            self.assertIsNotNone(model.item_id_embedding.weight.grad)
+            self.assertIsNotNone(model.masked_user_embedding.weight.grad)
+            self.assertIsNotNone(
+                model.masked_item_id_embedding.weight.grad
+            )
+            self.assertIsNotNone(model.mask_logits.grad)
+
     def test_auxiliary_loss_with_both_or_one_modality(self):
         for image, text in ((True, True), (True, False), (False, True)):
             with self.subTest(image=image, text=text):

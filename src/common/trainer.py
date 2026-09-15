@@ -70,6 +70,10 @@ class Trainer(AbstractTrainer):
         self.clip_grad_norm = config['clip_grad_norm']
         self.valid_metric = config['valid_metric'].lower()
         self.valid_metric_bigger = config['valid_metric_bigger']
+        tie_breaker = config['valid_metric_tie_breaker']
+        self.valid_metric_tie_breaker = (
+            str(tie_breaker).lower() if tie_breaker else None
+        )
         self.test_batch_size = config['eval_batch_size']
         self.device = config['device']
         self.weight_decay = 0.0
@@ -336,6 +340,53 @@ class Trainer(AbstractTrainer):
             #raise ValueError('Training loss is nan')
             return True
 
+    def _update_early_stopping(self, valid_score, valid_result):
+        """Update early stopping, optionally breaking primary-score ties."""
+        if self.valid_metric_tie_breaker is None:
+            return early_stopping(
+                valid_score,
+                self.best_valid_score,
+                self.cur_step,
+                max_step=self.stopping_step,
+                bigger=self.valid_metric_bigger,
+            )
+
+        tie_metric = self.valid_metric_tie_breaker
+        if tie_metric not in valid_result:
+            raise KeyError(
+                "Validation tie-breaker metric '{}' is unavailable.".format(
+                    tie_metric
+                )
+            )
+
+        tie_score = valid_result[tie_metric]
+        best_tie_score = self.best_valid_result.get(tie_metric)
+        if self.valid_metric_bigger:
+            primary_better = valid_score > self.best_valid_score
+            tie_better_or_equal = (
+                best_tie_score is None or tie_score >= best_tie_score
+            )
+        else:
+            primary_better = valid_score < self.best_valid_score
+            tie_better_or_equal = (
+                best_tie_score is None or tie_score <= best_tie_score
+            )
+
+        primary_equal = valid_score == self.best_valid_score
+        update_flag = primary_better or (
+            primary_equal and tie_better_or_equal
+        )
+        if update_flag:
+            return valid_score, 0, False, True
+
+        cur_step = self.cur_step + 1
+        return (
+            self.best_valid_score,
+            cur_step,
+            cur_step > self.stopping_step,
+            False,
+        )
+
     def _generate_train_loss_output(self, epoch_idx, s_time, e_time, losses):
         train_loss_output = 'epoch %d training [time: %.2fs, ' % (epoch_idx, e_time - s_time)
         if isinstance(losses, tuple):
@@ -384,9 +435,12 @@ class Trainer(AbstractTrainer):
             if (epoch_idx + 1) % self.eval_step == 0:
                 valid_start_time = time()
                 valid_score, valid_result = self._valid_epoch(valid_data)
-                self.best_valid_score, self.cur_step, stop_flag, update_flag = early_stopping(
-                    valid_score, self.best_valid_score, self.cur_step,
-                    max_step=self.stopping_step, bigger=self.valid_metric_bigger)
+                (
+                    self.best_valid_score,
+                    self.cur_step,
+                    stop_flag,
+                    update_flag,
+                ) = self._update_early_stopping(valid_score, valid_result)
                 valid_end_time = time()
                 valid_score_output = "epoch %d evaluating [time: %.2fs, valid_score: %f]" % \
                                      (epoch_idx, valid_end_time - valid_start_time, valid_score)

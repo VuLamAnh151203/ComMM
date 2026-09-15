@@ -318,19 +318,24 @@ class FREEDOM_MASKED(FREEDOM):
             'masked_to_full_teacher',
             'bidirectional_full_teacher',
         }
-        if self.cl_mode not in {'symmetric', *teacher_cl_modes}:
+        full_graph_cl_modes = {
+            'symmetric_full_graph',
+            *teacher_cl_modes,
+        }
+        if self.cl_mode not in {'symmetric', *full_graph_cl_modes}:
             raise ValueError(
                 "cl_mode must be 'symmetric', "
+                "'symmetric_full_graph', "
                 "'masked_to_full_teacher', or "
                 "'bidirectional_full_teacher'."
             )
         if (
-            self.cl_mode in teacher_cl_modes
+            self.cl_mode in full_graph_cl_modes
             and self.cl_weight > 0.0
             and self.ui_branch_mode != 'dual'
         ):
             raise ValueError(
-                "Teacher CL modes require ui_branch_mode 'dual'."
+                "Full-graph CL modes require ui_branch_mode 'dual'."
             )
         if self.aux_bpr_mode not in {'none', 'branches'}:
             raise ValueError(
@@ -1214,19 +1219,23 @@ class FREEDOM_MASKED(FREEDOM):
         )
         return 0.5 * (student_to_teacher + teacher_to_student)
 
-    @torch.no_grad()
-    def _full_graph_teacher_views(self):
-        """Build original-branch teacher views on the complete U-I graph."""
+    def _full_graph_original_views(self):
+        """Build differentiable original-branch views on the full U-I graph."""
         original_initial = torch.cat(
             (self._original_user_table(), self._original_item_table()),
             dim=0,
         )
-        teacher_embeddings = self._propagate_ui_graph(
+        full_embeddings = self._propagate_ui_graph(
             self.norm_adj, original_initial
-        ).detach()
-        return torch.split(
-            teacher_embeddings, (self.n_users, self.n_items), dim=0
         )
+        return torch.split(
+            full_embeddings, (self.n_users, self.n_items), dim=0
+        )
+
+    @torch.no_grad()
+    def _full_graph_teacher_views(self):
+        """Build detached original-branch teacher views on the full graph."""
+        return self._full_graph_original_views()
 
     def _contrastive_loss(self, representations, users, positive_items):
         if self.cl_weight == 0.0 or self.ui_branch_mode != 'dual':
@@ -1248,6 +1257,16 @@ class FREEDOM_MASKED(FREEDOM):
                 representations['masked_items'][unique_items],
                 teacher_items[unique_items],
                 bidirectional=bidirectional,
+            )
+        elif self.cl_mode == 'symmetric_full_graph':
+            full_users, full_items = self._full_graph_original_views()
+            user_loss = self.info_nce(
+                full_users[unique_users],
+                representations['masked_users'][unique_users],
+            )
+            item_loss = self.info_nce(
+                full_items[unique_items],
+                representations['masked_items'][unique_items],
             )
         else:
             user_loss = self.info_nce(

@@ -7,12 +7,14 @@ reg_weight: 0.0
 # fused: current behavior; original: FREEDOM-compatible U-I users;
 # masked: masked U-I users; branches: mean auxiliary loss of both U-I views.
 modality_aux_user_mode: fused
-cl_weight: 0.0
+cl_weight: 0.1
 cl_temperature: 0.2
 # symmetric: bidirectional CL with gradients to both sampled U-I views;
+# symmetric_full_graph: bidirectional CL between the masked view and the
+# full U-I graph without degree-dropout; gradients update both views;
 # masked_to_full_teacher: one-way masked -> stopgrad(full-graph FREEDOM);
 # bidirectional_full_teacher: two-way InfoNCE, but only masked gets gradient.
-cl_mode: bidirectional_full_teacher
+cl_mode: masked_to_full_teacher
 # none: only BPR on the fused output; branches: additionally supervise each
 # complete original/masked FREEDOM branch after its parallel I-I residual.
 aux_bpr_mode: none
@@ -23,7 +25,7 @@ knn_k: 10
 mm_image_weight: 0.1
 
 # Applied only to FREEDOM's degree-sensitive user-item branch.
-dropout: 0.0
+dropout: 0.8
 
 # Learned/static graph used by the independent masked branch.
 # Also supports random_fixed and random_dynamic non-learnable masks.
