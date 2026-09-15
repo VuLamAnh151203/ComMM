@@ -101,6 +101,9 @@ class PGL_MASKED(GeneralRecommender):
         self.cl_mode = str(
             _config_value(config, 'cl_mode', 'auto')
         ).lower()
+        self.cl_dropout_target = str(
+            _config_value(config, 'cl_dropout_target', 'fused')
+        ).lower()
         self.mask_weight = _config_value(config, 'mask_weight', 0.1)
         self.mask_keep_ratio = _config_value(config, 'mask_keep_ratio', 0.3)
         self.mask_binary_weight = _config_value(
@@ -135,11 +138,21 @@ class PGL_MASKED(GeneralRecommender):
         if not 0.0 <= self.cl_dropout < 1.0:
             raise ValueError('dropout must be in the interval [0, 1).')
         if self.cl_mode not in {
-            'auto', 'branch', 'dropout', 'branch_and_dropout'
+            'auto',
+            'branch',
+            'dropout',
+            'branch_and_dropout',
+            'masked_to_full_teacher',
+            'bidirectional_full_teacher',
+            'masked_to_full_teacher_and_dropout',
+            'bidirectional_full_teacher_and_dropout',
         }:
             raise ValueError(
-                "cl_mode must be 'auto', 'branch', 'dropout', or "
-                "'branch_and_dropout'."
+                'Unsupported cl_mode: {}.'.format(self.cl_mode)
+            )
+        if self.cl_dropout_target not in {'fused', 'full'}:
+            raise ValueError(
+                "cl_dropout_target must be 'fused' or 'full'."
             )
         if self.knn_k <= 0:
             raise ValueError('knn_k must be positive.')
@@ -166,13 +179,34 @@ class PGL_MASKED(GeneralRecommender):
             raise ValueError(
                 "ui_branch_mode must be 'dual' or 'masked_only'."
             )
+        dual_only_cl_modes = {
+            'branch',
+            'branch_and_dropout',
+            'masked_to_full_teacher',
+            'bidirectional_full_teacher',
+            'masked_to_full_teacher_and_dropout',
+            'bidirectional_full_teacher_and_dropout',
+        }
         if (
             self.cl_weight > 0.0
-            and self.cl_mode in {'branch', 'branch_and_dropout'}
+            and self.cl_mode in dual_only_cl_modes
             and self.ui_branch_mode != 'dual'
         ):
             raise ValueError(
-                "Branch CL modes require ui_branch_mode 'dual'."
+                "The selected branch CL mode requires "
+                "ui_branch_mode 'dual'."
+            )
+        if (
+            self.cl_weight > 0.0
+            and self.cl_dropout_target == 'full'
+            and self.cl_mode in {
+                'auto', 'dropout', 'branch_and_dropout'
+            }
+            and self.ui_branch_mode != 'dual'
+        ):
+            raise ValueError(
+                "cl_dropout_target 'full' requires "
+                "ui_branch_mode 'dual'."
             )
         if self.ui_fusion_mode not in {'gated_sum', 'gated_concat'}:
             raise ValueError(
@@ -894,6 +928,25 @@ class PGL_MASKED(GeneralRecommender):
             + F.cross_entropy(logits.transpose(0, 1), labels)
         )
 
+    def teacher_info_nce(
+        self, student_view, teacher_view, bidirectional=False
+    ):
+        """Contrast with a detached full view; update only the student."""
+        student_view = F.normalize(student_view, dim=1)
+        teacher_view = F.normalize(teacher_view.detach(), dim=1)
+        logits = torch.matmul(
+            student_view, teacher_view.transpose(0, 1)
+        )
+        logits = logits / self.cl_temperature
+        labels = torch.arange(logits.size(0), device=logits.device)
+        student_to_teacher = F.cross_entropy(logits, labels)
+        if not bidirectional:
+            return student_to_teacher
+        teacher_to_student = F.cross_entropy(
+            logits.transpose(0, 1), labels
+        )
+        return 0.5 * (student_to_teacher + teacher_to_student)
+
     def pgl_info_nce(self, first_view, second_view):
         """One-direction InfoNCE used by the original PGL implementation."""
         first_view = F.normalize(first_view, dim=1)
@@ -933,6 +986,39 @@ class PGL_MASKED(GeneralRecommender):
         )
         return 0.5 * (user_loss + item_loss)
 
+    def _teacher_branch_contrastive_loss(
+        self, representations, users, positive_items, bidirectional
+    ):
+        """Align masked U-I outputs to detached full U-I outputs."""
+        unique_users = torch.unique(users)
+        unique_items = torch.unique(positive_items)
+        user_loss = self.teacher_info_nce(
+            representations['masked_users'][unique_users],
+            representations['full_users'][unique_users],
+            bidirectional=bidirectional,
+        )
+        item_loss = self.teacher_info_nce(
+            representations['masked_items'][unique_items],
+            representations['full_items'][unique_items],
+            bidirectional=bidirectional,
+        )
+        return 0.5 * (user_loss + item_loss)
+
+    def _dropout_cl_embeddings(
+        self,
+        representations,
+        users,
+        positive_items,
+        fused_users,
+        fused_positive_items,
+    ):
+        if self.cl_dropout_target == 'full':
+            return (
+                representations['full_users'][users],
+                representations['full_items'][positive_items],
+            )
+        return fused_users, fused_positive_items
+
     def _contrastive_losses(
         self,
         representations,
@@ -954,17 +1040,44 @@ class PGL_MASKED(GeneralRecommender):
                 else 'branch'
             )
 
+        teacher_modes = {
+            'masked_to_full_teacher',
+            'bidirectional_full_teacher',
+            'masked_to_full_teacher_and_dropout',
+            'bidirectional_full_teacher_and_dropout',
+        }
+        dropout_modes = {
+            'dropout',
+            'branch_and_dropout',
+            'masked_to_full_teacher_and_dropout',
+            'bidirectional_full_teacher_and_dropout',
+        }
         branch_loss = zero
         dropout_loss = zero
         active_losses = []
-        if effective_mode in {'branch', 'branch_and_dropout'}:
+        if effective_mode in teacher_modes:
+            branch_loss = self._teacher_branch_contrastive_loss(
+                representations,
+                users,
+                positive_items,
+                bidirectional=effective_mode.startswith('bidirectional'),
+            )
+            active_losses.append(branch_loss)
+        elif effective_mode in {'branch', 'branch_and_dropout'}:
             branch_loss = self._branch_contrastive_loss(
                 representations, users, positive_items
             )
             active_losses.append(branch_loss)
-        if effective_mode in {'dropout', 'branch_and_dropout'}:
+        if effective_mode in dropout_modes:
+            dropout_users, dropout_items = self._dropout_cl_embeddings(
+                representations,
+                users,
+                positive_items,
+                user_embeddings,
+                positive_embeddings,
+            )
             dropout_loss = self._dropout_contrastive_loss(
-                user_embeddings, positive_embeddings
+                dropout_users, dropout_items
             )
             active_losses.append(dropout_loss)
 
@@ -1102,6 +1215,7 @@ class PGL_MASKED(GeneralRecommender):
                 'ui_fusion_mode': self.ui_fusion_mode,
                 'user_embedding_mode': self.user_embedding_mode,
                 'cl_mode': self.cl_mode,
+                'cl_dropout_target': self.cl_dropout_target,
                 'cl_weight': self.cl_weight,
                 'cl_temperature': self.cl_temperature,
                 'cl_dropout': self.cl_dropout,

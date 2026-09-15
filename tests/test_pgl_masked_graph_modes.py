@@ -65,6 +65,7 @@ class PGLGraphModeTest(unittest.TestCase):
         ui_branch_mode='dual',
         ui_fusion_mode='gated_sum',
         cl_mode='auto',
+        cl_dropout_target='fused',
     ):
         return NullableConfig({
             'USER_ID_FIELD': 'user_id',
@@ -93,6 +94,7 @@ class PGLGraphModeTest(unittest.TestCase):
             'cl_weight': 0.05,
             'cl_temperature': 0.2,
             'cl_mode': cl_mode,
+            'cl_dropout_target': cl_dropout_target,
             'dropout': 0.0,
             'mask_weight': 0.0,
         })
@@ -127,6 +129,7 @@ class PGLGraphModeTest(unittest.TestCase):
         ui_branch_mode='dual',
         ui_fusion_mode='gated_sum',
         cl_mode='auto',
+        cl_dropout_target='fused',
     ):
         return TestablePGLMasked(
             self.make_config(
@@ -135,6 +138,7 @@ class PGLGraphModeTest(unittest.TestCase):
                 ui_branch_mode,
                 ui_fusion_mode,
                 cl_mode,
+                cl_dropout_target,
             ),
             FakeTrainData(),
         )
@@ -241,7 +245,12 @@ class PGLGraphModeTest(unittest.TestCase):
             torch.tensor([0, 3]),
             torch.tensor([2, 0]),
         )
-        for cl_mode in ('branch', 'dropout', 'branch_and_dropout'):
+        for cl_mode in (
+            'branch',
+            'dropout',
+            'branch_and_dropout',
+            'bidirectional_full_teacher_and_dropout',
+        ):
             with self.subTest(cl_mode=cl_mode):
                 with tempfile.TemporaryDirectory() as temporary_root:
                     self.write_features(temporary_root)
@@ -249,6 +258,7 @@ class PGLGraphModeTest(unittest.TestCase):
                         temporary_root,
                         'double_full',
                         cl_mode=cl_mode,
+                        cl_dropout_target='full',
                     )
                     loss = model.calculate_loss(interaction)
                     self.assertTrue(torch.isfinite(loss))
@@ -269,6 +279,36 @@ class PGLGraphModeTest(unittest.TestCase):
                             components['contrastive'],
                             0.5 * (branch_loss + dropout_loss),
                         )
+
+    def test_teacher_branch_cl_stops_full_user_gradient(self):
+        with tempfile.TemporaryDirectory() as temporary_root:
+            self.write_features(temporary_root)
+            model = self.make_model(
+                temporary_root,
+                'soft',
+                cl_mode='bidirectional_full_teacher',
+            )
+            interaction = (
+                torch.tensor([0, 2]),
+                torch.tensor([0, 3]),
+                torch.tensor([2, 0]),
+            )
+            users, positive_items, _ = interaction
+            representations = model._encode()
+            loss = model._teacher_branch_contrastive_loss(
+                representations,
+                users,
+                positive_items,
+                bidirectional=True,
+            )
+            self.assertTrue(torch.isfinite(loss))
+            loss.backward()
+
+            self.assertIsNone(model.user_text.weight.grad)
+            self.assertIsNone(model.user_image.weight.grad)
+            self.assertIsNotNone(model.second_user_text.weight.grad)
+            self.assertIsNotNone(model.second_user_image.weight.grad)
+            self.assertIsNotNone(model.mask_logits.grad)
 
     def test_fixed_and_dynamic_random_masks(self):
         for graph_mode in ('random_fixed', 'random_dynamic'):

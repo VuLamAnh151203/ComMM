@@ -14,9 +14,14 @@ cl_weight: 0.1
 cl_temperature: 0.2
 # auto: branch CL for dual, dropout CL for masked_only (legacy behavior);
 # branch: CL between full/masked pre-fusion U-I representations;
-# dropout: original PGL CL on two dropout views of fused representations;
-# branch_and_dropout: mean of branch CL and dropout CL.
-cl_mode: branch_and_dropout
+# dropout: original PGL CL on two dropout views of the selected target;
+# branch_and_dropout: mean of branch CL and dropout CL;
+# masked_to_full_teacher: one-way masked -> stopgrad(full);
+# bidirectional_full_teacher: two-way InfoNCE, full is stopgrad;
+# Append _and_dropout to either teacher mode to add dropout CL.
+cl_mode: bidirectional_full_teacher_and_dropout
+# fused: dropout CL on fused output; full: dropout CL on full U-I branch.
+cl_dropout_target: fused
 dropout: 0.2
 mask_weight: 0.1
 # mask_weight: 0.0
