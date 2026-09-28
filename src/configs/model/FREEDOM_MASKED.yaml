@@ -71,6 +71,7 @@ ui_branch_mode: dual
 # gated_sum: learned weighted sum; gated_concat: gated 2x input projected
 # back to branch dimension; gloria_concat: direct [original | masked], no
 # gate/projection, output 2x; each branch keeps its parallel FREEDOM I-I path.
+# mean: 0.5*(original + masked), without a learned gate/projection.
 ui_fusion_mode: gated_sum
 # shared: one gate network for both node types; separate: user/item gates.
 ui_gate_mode: separate

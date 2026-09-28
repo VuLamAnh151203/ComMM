@@ -239,6 +239,24 @@ class PGLGraphModeTest(unittest.TestCase):
                 'gated_concat',
             )
 
+    def test_mean_fusion_averages_branches_without_parameters(self):
+        with tempfile.TemporaryDirectory() as temporary_root:
+            self.write_features(temporary_root)
+            model = self.make_model(
+                temporary_root,
+                'double_full',
+                ui_fusion_mode='mean',
+            )
+            full = torch.randn(7, model.ui_embedding_dim)
+            masked = torch.randn_like(full)
+            fused, gate = model._fuse_ui_branches(full, masked)
+
+            torch.testing.assert_close(fused, 0.5 * (full + masked))
+            self.assertIsNone(gate)
+            self.assertIsNone(model.fusion_gate)
+            self.assertIsNone(model.fusion_projection)
+            self.assert_forward_and_loss(model)
+
     def test_branch_dropout_contrastive_modes(self):
         interaction = (
             torch.tensor([0, 2]),

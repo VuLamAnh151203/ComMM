@@ -208,9 +208,12 @@ class PGL_MASKED(GeneralRecommender):
                 "cl_dropout_target 'full' requires "
                 "ui_branch_mode 'dual'."
             )
-        if self.ui_fusion_mode not in {'gated_sum', 'gated_concat'}:
+        if self.ui_fusion_mode not in {
+            'gated_sum', 'gated_concat', 'mean'
+        }:
             raise ValueError(
-                "ui_fusion_mode must be 'gated_sum' or 'gated_concat'."
+                "ui_fusion_mode must be 'gated_sum', 'gated_concat', "
+                "or 'mean'."
             )
         if (
             self.ui_fusion_mode == 'gated_concat'
@@ -287,19 +290,20 @@ class PGL_MASKED(GeneralRecommender):
                 self.mm_embedding_dim, self.final_embedding_dim
             )
 
-        self.fusion_gate = nn.Linear(
-            2 * self.ui_embedding_dim, self.ui_embedding_dim
-        )
-        nn.init.xavier_uniform_(self.fusion_gate.weight)
-        nn.init.zeros_(self.fusion_gate.bias)
+        self.fusion_gate = None
+        self.fusion_projection = None
+        if self.ui_fusion_mode != 'mean':
+            self.fusion_gate = nn.Linear(
+                2 * self.ui_embedding_dim, self.ui_embedding_dim
+            )
+            nn.init.xavier_uniform_(self.fusion_gate.weight)
+            nn.init.zeros_(self.fusion_gate.bias)
         if self.ui_fusion_mode == 'gated_concat':
             self.fusion_projection = nn.Linear(
                 2 * self.ui_embedding_dim, self.ui_embedding_dim
             )
             nn.init.xavier_uniform_(self.fusion_projection.weight)
             nn.init.zeros_(self.fusion_projection.bias)
-        else:
-            self.fusion_projection = None
         self.cl_dropout_layer = nn.Dropout(self.cl_dropout)
 
         self._build_or_load_mm_graph(config)
@@ -831,6 +835,9 @@ class PGL_MASKED(GeneralRecommender):
         return self.mm_output_projection(propagated_items)
 
     def _fuse_ui_branches(self, full_embeddings, masked_embeddings):
+        if self.ui_fusion_mode == 'mean':
+            return 0.5 * (full_embeddings + masked_embeddings), None
+
         branch_embeddings = torch.cat(
             (full_embeddings, masked_embeddings), dim=-1
         )

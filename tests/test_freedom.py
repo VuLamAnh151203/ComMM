@@ -418,6 +418,7 @@ class FreedomMaskedGraphTest(FreedomTestBase):
             ('dual', 'gated_sum', 3),
             ('dual', 'gated_concat', 3),
             ('dual', 'gloria_concat', 6),
+            ('dual', 'mean', 3),
             ('masked_only', 'gated_sum', 3),
         )
         for branch_mode, fusion_mode, expected_dim in cases:
@@ -436,6 +437,48 @@ class FreedomMaskedGraphTest(FreedomTestBase):
                     if branch_mode == 'dual' and fusion_mode == 'gated_concat':
                         self.assertIsNotNone(model.user_concat_projection)
                         self.assertIsNotNone(model.item_concat_projection)
+
+    def test_mean_fusion_averages_parallel_branches_without_gates(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.write_features(root)
+            model = self.make_model(
+                root,
+                mask_graph_mode='double_full',
+                user_embedding_mode='separate',
+                item_embedding_mode='separate',
+                ui_fusion_mode='mean',
+                cl_weight=0.0,
+            )
+            representations = model._encode()
+
+            self.assertIsNone(model.fusion_gate)
+            self.assertIsNone(model.user_fusion_gate)
+            self.assertIsNone(model.item_fusion_gate)
+            self.assertIsNone(model.mm_fusion_gate)
+            self.assertIsNone(representations['user_gate'])
+            self.assertIsNone(representations['item_gate'])
+            self.assertIsNone(representations['mm_gate'])
+            torch.testing.assert_close(
+                representations['users'],
+                0.5 * (
+                    representations['full_users']
+                    + representations['masked_users']
+                ),
+            )
+            torch.testing.assert_close(
+                representations['fused_ui_items'],
+                0.5 * (
+                    representations['full_items']
+                    + representations['masked_items']
+                ),
+            )
+            torch.testing.assert_close(
+                representations['mm_items'],
+                0.5 * (
+                    representations['full_mm_items']
+                    + representations['masked_mm_items']
+                ),
+            )
 
     def test_gloria_concat_has_no_gate_and_parallel_freedom_paths(self):
         with tempfile.TemporaryDirectory() as root:

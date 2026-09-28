@@ -280,11 +280,11 @@ class FREEDOM_MASKED(FREEDOM):
                 "ui_branch_mode must be 'dual' or 'masked_only'."
             )
         if self.ui_fusion_mode not in {
-            'gated_sum', 'gated_concat', 'gloria_concat'
+            'gated_sum', 'gated_concat', 'gloria_concat', 'mean'
         }:
             raise ValueError(
                 "ui_fusion_mode must be 'gated_sum', 'gated_concat', "
-                "or 'gloria_concat'."
+                "'gloria_concat', or 'mean'."
             )
         if (
             self.ui_fusion_mode == 'gloria_concat'
@@ -601,7 +601,7 @@ class FREEDOM_MASKED(FREEDOM):
 
         if self.ui_branch_mode != 'dual':
             return
-        if self.ui_fusion_mode == 'gloria_concat':
+        if self.ui_fusion_mode in {'gloria_concat', 'mean'}:
             return
 
         if self.ui_gate_mode == 'shared':
@@ -1064,6 +1064,8 @@ class FREEDOM_MASKED(FREEDOM):
     def _fuse_ui_pair(self, original, masked, node_type):
         if self.ui_fusion_mode == 'gloria_concat':
             return torch.cat((original, masked), dim=-1), None
+        if self.ui_fusion_mode == 'mean':
+            return 0.5 * (original + masked), None
         gate_module, projection = self._ui_fusion_modules(node_type)
         gate = torch.sigmoid(
             gate_module(torch.cat((original, masked), dim=-1))
@@ -1079,6 +1081,8 @@ class FREEDOM_MASKED(FREEDOM):
         return fused, gate
 
     def _fuse_mm_items(self, original_items, masked_items, item_gate):
+        if self.ui_fusion_mode == 'mean':
+            return 0.5 * (original_items + masked_items), None
         if self.mm_gate_mode == 'reuse_ui_item':
             mm_gate = item_gate
         else:
