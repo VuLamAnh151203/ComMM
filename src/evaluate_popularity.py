@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import pickle
 from logging import getLogger
 
 import numpy as np
@@ -24,11 +25,21 @@ from utils.utils import get_model, init_seed
 MASKED_MODELS = {'PGL_MASKED', 'FREEDOM_MASKED'}
 
 
-def _load_checkpoint(path):
+def _load_checkpoint(path, trusted_checkpoint=False):
     try:
         return torch.load(path, map_location='cpu', weights_only=True)
     except TypeError:
         return torch.load(path, map_location='cpu')
+    except pickle.UnpicklingError as error:
+        if not trusted_checkpoint:
+            raise RuntimeError(
+                'The checkpoint contains Python/NumPy objects blocked by '
+                'PyTorch safe loading. If this is a checkpoint you created '
+                'and trust, rerun with --trusted-checkpoint.'
+            ) from error
+        return torch.load(
+            path, map_location='cpu', weights_only=False
+        )
 
 
 def _checkpoint_state_and_config(checkpoint):
@@ -137,7 +148,9 @@ def evaluate_checkpoint(args):
     checkpoint_path = os.path.abspath(args.checkpoint)
     if not os.path.isfile(checkpoint_path):
         raise FileNotFoundError(checkpoint_path)
-    checkpoint = _load_checkpoint(checkpoint_path)
+    checkpoint = _load_checkpoint(
+        checkpoint_path, getattr(args, 'trusted_checkpoint', False)
+    )
     state_dict, saved_config = _checkpoint_state_and_config(checkpoint)
     config_overrides = dict(saved_config or {})
     config_overrides.update(_load_json(args.config_json))
@@ -261,6 +274,13 @@ def _parse_args():
         description='Evaluate ComMM checkpoint by train-item popularity.'
     )
     parser.add_argument('--checkpoint', required=True)
+    parser.add_argument(
+        '--trusted-checkpoint', action='store_true',
+        help=(
+            'Allow legacy checkpoints containing pickled Python/NumPy '
+            'objects. Use only for checkpoints from a trusted source.'
+        ),
+    )
     parser.add_argument('--model')
     parser.add_argument('--dataset')
     parser.add_argument('--data-path')
