@@ -876,6 +876,7 @@ class PGL_MASKED(GeneralRecommender):
             return {
                 'users': masked_users,
                 'items': masked_items + mm_items,
+                'mm_items': mm_items,
                 'full_users': None,
                 'full_items': None,
                 'masked_users': masked_users,
@@ -907,6 +908,7 @@ class PGL_MASKED(GeneralRecommender):
         return {
             'users': fused_users,
             'items': final_items,
+            'mm_items': mm_items,
             'full_users': full_users,
             'full_items': full_items,
             'masked_users': masked_users,

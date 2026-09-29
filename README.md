@@ -1,5 +1,24 @@
 # ComMM
 
+## Popular/niche checkpoint evaluation
+
+Popularity is computed from the train split only. The top 20% of catalog
+items are `popular`; the remaining items are `niche`. Ranking still uses the
+full catalog after masking train history, then test ground truth is grouped.
+
+From `ComMM/src`:
+
+```bash
+python evaluate_popularity.py \
+  --checkpoint saved/FREEDOM_MASKED-baby-seed999-xxx.pth \
+  --views full masked fused \
+  --popular-ratio 0.2
+```
+
+`PGL_MASKED` and `FREEDOM_MASKED` support `full`, `masked`, and `fused`.
+Other models expose only `final`. Results are saved beside the checkpoint as
+`.popularity.json` and `.popularity.csv` unless output paths are provided.
+
 `ComMM` là bản tách gọn của các mô hình PGL và FREEDOM trong workspace này. Thư
 mục chỉ giữ bốn model cần thiết cùng hạ tầng huấn luyện/đánh giá dùng chung:
 
