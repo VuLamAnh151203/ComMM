@@ -14,6 +14,7 @@ from utils.configurator import Config
 from utils.dataloader import TrainDataLoader
 from utils.dataset import RecDataset
 from utils.logger import init_logger
+from utils.popularity_evaluator import build_popularity_groups
 from utils.utils import get_model, init_seed
 
 
@@ -135,13 +136,25 @@ def _selection_vectors(model):
 
 
 @torch.no_grad()
-def _extract_user_edges(model, user_id, requested_items=None):
+def _extract_user_edges(
+    model,
+    user_id,
+    item_degrees,
+    popular_mask,
+    requested_items=None,
+):
     if not 0 <= user_id < model.n_users:
         raise ValueError(
             'user_id {} is outside [0, {}).'.format(user_id, model.n_users)
         )
 
     interaction_count = int(model.num_interactions)
+    item_degrees = np.asarray(item_degrees, dtype=np.int64)
+    popular_mask = np.asarray(popular_mask, dtype=bool)
+    if item_degrees.size != model.n_items:
+        raise ValueError('Item degrees do not align with the catalog.')
+    if popular_mask.size != model.n_items:
+        raise ValueError('Popularity mask does not align with the catalog.')
     forward_edges = model.ui_edge_index[:, :interaction_count]
     edge_users = forward_edges[0].detach().cpu().numpy().astype(np.int64)
     edge_items = (
@@ -206,6 +219,11 @@ def _extract_user_edges(model, user_id, requested_items=None):
             'rank': None,
             'user_id': int(user_id),
             'item_id': item_id,
+            'item_train_degree': int(item_degrees[item_id]),
+            'item_popularity_group': (
+                'popular' if popular_mask[item_id] else 'niche'
+            ),
+            'is_popular': bool(popular_mask[item_id]),
             'edge_id': int(edge_id),
             'duplicate_pair_count': pair_counts[(user_id, item_id)],
             'mask_graph_mode': model.mask_graph_mode,
@@ -322,7 +340,16 @@ def inspect_checkpoint(args):
     )
     model = get_model(model_name)(config, train_data).to(config['device'])
     model.load_state_dict(state_dict, strict=True)
-    rows = _extract_user_edges(model, args.user_id, args.item_ids)
+    popular_mask, item_degrees = build_popularity_groups(
+        train_dataset, dataset.item_num, args.popular_ratio
+    )
+    rows = _extract_user_edges(
+        model,
+        args.user_id,
+        item_degrees,
+        popular_mask,
+        args.item_ids,
+    )
 
     output_base = '{}.user_{}_edges'.format(
         os.path.splitext(checkpoint_path)[0], args.user_id
@@ -346,6 +373,16 @@ def inspect_checkpoint(args):
         'requested_item_ids': args.item_ids,
         'requested_items_without_training_edge': missing_requested_items,
         'returned_edges': len(rows),
+        'popular_ratio': args.popular_ratio,
+        'popular_items': int(popular_mask.sum()),
+        'niche_items': int((~popular_mask).sum()),
+        'item_degree_definition': (
+            'number of item interactions in the training split'
+        ),
+        'popularity_definition': (
+            'top popular_ratio of the complete catalog by train degree; '
+            'ties are broken by ascending item_id'
+        ),
         'sort': (
             'mask_probability descending, eval selection descending, '
             'effective weight descending, item_id ascending'
@@ -379,6 +416,7 @@ def _parse_args():
     parser.add_argument('--config-json')
     parser.add_argument('--gpu-id', type=int)
     parser.add_argument('--cpu', action='store_true')
+    parser.add_argument('--popular-ratio', type=float, default=0.2)
     parser.add_argument('--output-csv')
     parser.add_argument('--output-json')
     return parser.parse_args()
