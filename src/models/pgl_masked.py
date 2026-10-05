@@ -161,13 +161,13 @@ class PGL_MASKED(GeneralRecommender):
                 "mask_degree_mode must be either 'full' or 'masked'."
             )
         if self.mask_graph_mode not in {
-            'soft', 'hard', 'double_full', 'svd', 'local_prunning',
-            'random_fixed', 'random_dynamic'
+            'soft', 'hard', 'constant_mask', 'double_full', 'svd',
+            'local_prunning', 'random_fixed', 'random_dynamic'
         }:
             raise ValueError(
-                "mask_graph_mode must be 'soft', 'hard', 'double_full', "
-                "'svd', 'local_prunning', 'random_fixed', or "
-                "'random_dynamic'."
+                "mask_graph_mode must be 'soft', 'hard', "
+                "'constant_mask', 'double_full', 'svd', "
+                "'local_prunning', 'random_fixed', or 'random_dynamic'."
             )
         if self.hard_mask_temperature <= 0.0:
             raise ValueError('hard_mask_temperature must be positive.')
@@ -327,7 +327,7 @@ class PGL_MASKED(GeneralRecommender):
             self.mask_keep_ratio / (1.0 - self.mask_keep_ratio)
         )
         if self.mask_graph_mode in {
-            'double_full', 'svd', 'local_prunning',
+            'constant_mask', 'double_full', 'svd', 'local_prunning',
             'random_fixed', 'random_dynamic'
         }:
             self.register_parameter('mask_logits', None)
@@ -663,7 +663,12 @@ class PGL_MASKED(GeneralRecommender):
                 )
             return self.local_pruned_adj, None
 
-        interaction_mask = torch.sigmoid(self.mask_logits)
+        if self.mask_graph_mode == 'constant_mask':
+            interaction_mask = self.full_norm_edge_weights.new_full(
+                (self.num_interactions,), self.mask_keep_ratio
+            )
+        else:
+            interaction_mask = torch.sigmoid(self.mask_logits)
         if self.mask_graph_mode == 'hard':
             masked_adj = self._hard_masked_ui_adjacency(interaction_mask)
             return masked_adj, interaction_mask
@@ -1125,15 +1130,20 @@ class PGL_MASKED(GeneralRecommender):
             mask_mean = ranking_loss.new_ones(())
         else:
             mask_mean = interaction_mask.mean()
-            budget_loss = (
-                mask_mean - self.mask_keep_ratio
-            ).pow(2)
-            binary_loss = (
-                interaction_mask * (1.0 - interaction_mask)
-            ).mean()
-            mask_loss = (
-                budget_loss + self.mask_binary_weight * binary_loss
-            )
+            if self.mask_graph_mode == 'constant_mask':
+                # The constant mask is deliberately non-learnable. Avoid
+                # adding a constant binary penalty to the reported loss.
+                mask_loss = ranking_loss.new_zeros(())
+            else:
+                budget_loss = (
+                    mask_mean - self.mask_keep_ratio
+                ).pow(2)
+                binary_loss = (
+                    interaction_mask * (1.0 - interaction_mask)
+                ).mean()
+                mask_loss = (
+                    budget_loss + self.mask_binary_weight * binary_loss
+                )
 
         total_loss = (
             ranking_loss
@@ -1200,6 +1210,14 @@ class PGL_MASKED(GeneralRecommender):
             masks['random_branch'] = {
                 'train_selected': train_selected,
                 'selected_at_keep_ratio': eval_selected,
+            }
+
+        if self.mask_graph_mode == 'constant_mask':
+            probabilities = self.full_norm_edge_weights.new_full(
+                (self.num_interactions,), self.mask_keep_ratio
+            )
+            masks['constant_branch'] = {
+                'probabilities': probabilities.cpu(),
             }
 
         embedding_tables = {}

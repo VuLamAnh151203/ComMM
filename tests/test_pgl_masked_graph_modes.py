@@ -389,6 +389,56 @@ class PGLGraphModeTest(unittest.TestCase):
                         restored.random_keep_count,
                     )
 
+    def test_constant_mask_uses_configured_keep_ratio(self):
+        with tempfile.TemporaryDirectory() as temporary_root:
+            self.write_features(temporary_root)
+            model = self.make_model(temporary_root, 'constant_mask')
+
+            self.assertIsNone(model.mask_logits)
+            adjacency, probabilities = model._masked_ui_adjacency()
+            expected_probabilities = torch.full(
+                (model.num_interactions,), model.mask_keep_ratio
+            )
+            torch.testing.assert_close(
+                probabilities, expected_probabilities
+            )
+            torch.testing.assert_close(
+                adjacency.to_dense(),
+                model.mask_keep_ratio * model.norm_adj.to_dense(),
+            )
+
+            # Re-normalizing a graph whose every edge has the same constant
+            # weight cancels that constant and recovers the full adjacency.
+            model.mask_degree_mode = 'masked'
+            renormalized_adjacency = model._masked_ui_adjacency()[0]
+            torch.testing.assert_close(
+                renormalized_adjacency.to_dense(),
+                model.norm_adj.to_dense(),
+            )
+            model.mask_degree_mode = 'full'
+
+            model.train()
+            training_adjacency = model._masked_ui_adjacency()[0].to_dense()
+            model.eval()
+            inference_adjacency = model._masked_ui_adjacency()[0].to_dense()
+            torch.testing.assert_close(training_adjacency, inference_adjacency)
+
+            model.train()
+            self.assert_forward_and_loss(model).backward()
+            torch.testing.assert_close(
+                model.latest_loss_components['mask'], torch.tensor(0.0)
+            )
+            torch.testing.assert_close(
+                model.latest_loss_components['mask_mean'],
+                torch.tensor(model.mask_keep_ratio),
+            )
+
+            artifacts = model.get_analysis_artifacts()
+            torch.testing.assert_close(
+                artifacts['masks']['constant_branch']['probabilities'],
+                expected_probabilities,
+            )
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -30,7 +30,9 @@ mask_keep_ratio: 0.3
 mask_binary_weight: 0.1
 # full: use D_full for faster edge gating; masked: recompute D_mask.
 mask_degree_mode: full
-# soft: weighted full graph; hard: retain mask_keep_ratio edges;
+# soft: learned weighted full graph; hard: retain mask_keep_ratio edges;
+# constant_mask: set every edge mask to mask_keep_ratio, without learning;
+# with mask_degree_mode=masked the constant cancels during normalization.
 # double_full: no mask, both branches use the complete U-I graph;
 # svd: one full branch and one original-PGL global SVD branch;
 # local_prunning: full + locally pruned during training; full + full at inference.
