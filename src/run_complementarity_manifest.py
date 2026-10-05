@@ -32,6 +32,10 @@ def main():
     parser.add_argument('--pairwise-batch-size', type=int, default=65536)
     parser.add_argument('--user-batch-size', type=int, default=256)
     parser.add_argument('--device', default='cpu')
+    parser.add_argument(
+        '--reference-mode', default='internal-full',
+        choices=('internal-full', 'backbone-checkpoint'),
+    )
     parser.add_argument('--trusted-checkpoint', action='store_true')
     args = parser.parse_args()
 
@@ -60,11 +64,27 @@ def main():
     )
     for row in rows:
         checkpoint = row.get('checkpoint') or row.get('checkpoint_path')
+        reference_checkpoint = (
+            row.get('reference_checkpoint')
+            or row.get('reference_checkpoint_path')
+        )
         training_seed = row.get('training_seed') or row.get('seed')
         config = row.get('config') or row.get('config_path')
+        reference_config = (
+            row.get('reference_config')
+            or row.get('reference_config_path')
+        )
         if not checkpoint or training_seed in (None, ''):
             raise ValueError(
                 'Every manifest row needs a checkpoint path and seed.'
+            )
+        if (
+            args.reference_mode == 'backbone-checkpoint'
+            and not reference_checkpoint
+        ):
+            raise ValueError(
+                'Every manifest row needs reference_checkpoint when using '
+                'the backbone-checkpoint reference mode.'
             )
         command = [
             sys.executable, script,
@@ -74,6 +94,7 @@ def main():
             '--checkpoint', _manifest_path(
                 checkpoint, manifest_dir
             ),
+            '--reference-mode', args.reference_mode,
             '--output-dir', args.output_dir,
             '--k', str(args.k),
             '--num-negatives', str(args.num_negatives),
@@ -85,6 +106,15 @@ def main():
         _optional(
             command, '--config',
             _manifest_path(config, manifest_dir),
+        )
+        _optional(
+            command, '--reference-checkpoint',
+            _manifest_path(reference_checkpoint, manifest_dir),
+        )
+        _optional(command, '--reference-model', row.get('reference_model'))
+        _optional(
+            command, '--reference-config',
+            _manifest_path(reference_config, manifest_dir),
         )
         _optional(
             command, '--data-path',

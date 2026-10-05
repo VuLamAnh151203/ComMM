@@ -1,4 +1,4 @@
-"""Evaluate predictive and Top-K complementarity from one masked checkpoint."""
+"""Evaluate PCML fusion against an internal or original-backbone reference."""
 
 import argparse
 import json
@@ -33,8 +33,13 @@ from utils.dataset import RecDataset
 from utils.utils import get_model, init_seed
 
 
-SCRIPT_VERSION = 'pcml-complementarity-v1'
+SCRIPT_VERSION = 'pcml-complementarity-v2'
 SUPPORTED_MODELS = {'PGL_MASKED', 'FREEDOM_MASKED'}
+SUPPORTED_BACKBONES = {'PGL', 'FREEDOM'}
+DEFAULT_BACKBONE = {
+    'PGL_MASKED': 'PGL',
+    'FREEDOM_MASKED': 'FREEDOM',
+}
 
 
 def _load_checkpoint(path, trusted=False):
@@ -61,6 +66,103 @@ def _state_and_config(checkpoint):
     if checkpoint and all(torch.is_tensor(value) for value in checkpoint.values()):
         return checkpoint, {}
     raise ValueError('Checkpoint does not contain a model state_dict.')
+
+
+def _apply_runtime_overrides(overrides, args):
+    """Apply location/device options consistently to both checkpoints."""
+    overrides = dict(overrides or {})
+    overrides.pop('device', None)
+    if args.data_path:
+        overrides['data_path'] = os.path.abspath(args.data_path)
+    if args.device:
+        device = args.device.lower()
+        overrides['use_gpu'] = device != 'cpu'
+        if device.startswith('cuda:'):
+            overrides['gpu_id'] = int(device.split(':', 1)[1])
+    overrides['save_recommended_topk'] = False
+    return overrides
+
+
+def _load_backbone_reference(args, pcml_model_name, dataset_name, train_data):
+    """Load the original backbone checkpoint used as external reference."""
+    if args.reference_mode == 'internal-full':
+        if (
+            args.reference_checkpoint
+            or args.reference_model
+            or args.reference_config
+        ):
+            raise ValueError(
+                'Reference checkpoint/model/config options require '
+                '--reference-mode backbone-checkpoint.'
+            )
+        return None, None, None, None, None
+
+    if not args.reference_checkpoint:
+        raise ValueError(
+            '--reference-checkpoint is required when --reference-mode is '
+            'backbone-checkpoint.'
+        )
+    reference_path = os.path.abspath(args.reference_checkpoint)
+    if not os.path.isfile(reference_path):
+        raise FileNotFoundError(reference_path)
+    reference_checkpoint = _load_checkpoint(
+        reference_path, args.trusted_checkpoint
+    )
+    reference_state, saved_reference_config = _state_and_config(
+        reference_checkpoint
+    )
+    reference_overrides = dict(saved_reference_config or {})
+    reference_overrides.update(_load_config_file(args.reference_config))
+    saved_reference_dataset = reference_overrides.get('dataset')
+    if (
+        saved_reference_dataset
+        and str(saved_reference_dataset).lower() != dataset_name
+    ):
+        raise ValueError(
+            'Reference checkpoint dataset {!r} does not match PCML dataset '
+            '{!r}.'.format(saved_reference_dataset, dataset_name)
+        )
+    reference_model_name = str(
+        args.reference_model
+        or reference_overrides.get('model')
+        or DEFAULT_BACKBONE[pcml_model_name]
+    ).upper()
+    expected_backbone = DEFAULT_BACKBONE[pcml_model_name]
+    if reference_model_name not in SUPPORTED_BACKBONES:
+        raise ValueError(
+            'Supported reference backbones are {}.'.format(
+                sorted(SUPPORTED_BACKBONES)
+            )
+        )
+    if reference_model_name != expected_backbone:
+        raise ValueError(
+            '{} must be compared with its original {} backbone, not {}.'
+            .format(pcml_model_name, expected_backbone, reference_model_name)
+        )
+
+    reference_overrides = _apply_runtime_overrides(
+        reference_overrides, args
+    )
+    reference_config = Config(
+        model=reference_model_name,
+        dataset=dataset_name,
+        config_dict=reference_overrides,
+        mg=False,
+    )
+    reference_model = get_model(reference_model_name)(
+        reference_config, train_data
+    ).to(reference_config['device'])
+    reference_model.load_state_dict(reference_state, strict=True)
+    if hasattr(reference_model, 'post_epoch_processing'):
+        reference_model.post_epoch_processing()
+    reference_model.eval()
+    return (
+        reference_model,
+        reference_model_name,
+        reference_checkpoint,
+        reference_path,
+        reference_config,
+    )
 
 
 def _load_config_file(path):
@@ -222,10 +324,13 @@ def _write_readme(output_dir):
     path = os.path.join(output_dir, 'README.md')
     content = """# PCML complementarity evaluation
 
-This directory contains evaluation-only results. Reference and fused scores
-come from the same masked-model checkpoint. Pairwise metrics use the cached
-uniform held-out triplets; Top-20 metrics use full-catalog ranking and exclude
-training positives exactly like ComMM's test evaluator.
+This directory contains evaluation-only results. By default, reference and
+fused scores come from the same masked-model checkpoint. With
+`--reference-mode backbone-checkpoint`, reference scores instead come from an
+independently trained original PGL/FREEDOM checkpoint, while fused scores still
+come from the PCML checkpoint. Pairwise metrics use the cached uniform held-out
+triplets; Top-20 metrics use full-catalog ranking and exclude training positives
+exactly like ComMM's test evaluator.
 
 The deterministic ranking tie policy is descending raw score then ascending
 item ID. `checks/*.json` reports any boundary ties and comparison with the
@@ -238,6 +343,16 @@ Single checkpoint:
 python evaluate_complementarity.py --checkpoint /path/model.pth \\
   --dataset baby --model PGL_MASKED --device cuda:0 \\
   --output-dir results/complementarity
+```
+
+External original-backbone reference:
+
+```bash
+python evaluate_complementarity.py --checkpoint /path/pcml.pth \\
+  --reference-mode backbone-checkpoint \\
+  --reference-checkpoint /path/pgl_backbone.pth \\
+  --dataset baby --model PGL_MASKED --device cuda:0 \\
+  --output-dir results/complementarity_backbone
 ```
 
 Manifest batch and standalone aggregation:
@@ -271,7 +386,7 @@ def _update_protocol(path, core, dataset_entry, run_entry):
         dataset_entry['dataset'], dataset_entry['id_mapping_hash'][:16]
     )
     payload['datasets'][dataset_key] = dataset_entry
-    payload['runs'][run_entry['checkpoint_id']] = run_entry
+    payload['runs'][run_entry['run_id']] = run_entry
     atomic_json_dump(payload, path)
 
 
@@ -298,15 +413,7 @@ def evaluate_checkpoint(args):
                 sorted(SUPPORTED_MODELS)
             )
         )
-    overrides.pop('device', None)
-    if args.data_path:
-        overrides['data_path'] = os.path.abspath(args.data_path)
-    if args.device:
-        device = args.device.lower()
-        overrides['use_gpu'] = device != 'cpu'
-        if device.startswith('cuda:'):
-            overrides['gpu_id'] = int(device.split(':', 1)[1])
-    overrides['save_recommended_topk'] = False
+    overrides = _apply_runtime_overrides(overrides, args)
     config = Config(
         model=model_name, dataset=dataset_name,
         config_dict=overrides, mg=False,
@@ -334,7 +441,20 @@ def evaluate_checkpoint(args):
     if hasattr(model, 'post_epoch_processing'):
         model.post_epoch_processing()
     model.eval()
-    scorer = MaskedModelComplementarityScorer(model)
+    (
+        reference_model,
+        reference_model_name,
+        reference_checkpoint,
+        reference_checkpoint_path,
+        reference_config,
+    ) = _load_backbone_reference(
+        args, model_name, dataset_name, train_data
+    )
+    scorer = MaskedModelComplementarityScorer(
+        model,
+        reference_model=reference_model,
+        reference_model_name=reference_model_name,
+    )
 
     test_positives = positives_by_user(test_dataset)
     train_positives = positives_by_user(train_dataset)
@@ -384,6 +504,9 @@ def evaluate_checkpoint(args):
 
     sample_users = np.asarray(sorted(test_positives)[:8], dtype=np.int64)
     fused_score_max_error = scorer.check_against_model(sample_users)
+    reference_score_max_error = scorer.check_reference_against_model(
+        sample_users
+    )
     pairwise = _evaluate_pairwise(
         scorer, triplets, args.pairwise_batch_size
     )
@@ -394,17 +517,44 @@ def evaluate_checkpoint(args):
 
     checkpoint_hash = sha256_file(checkpoint_path)
     checkpoint_id = checkpoint_hash[:16]
+    reference_checkpoint_hash = (
+        sha256_file(reference_checkpoint_path)
+        if reference_checkpoint_path else ''
+    )
+    reference_checkpoint_id = (
+        reference_checkpoint_hash[:16] if reference_checkpoint_hash else ''
+    )
+    run_id = sha256_json({
+        'pcml_checkpoint_sha256': checkpoint_hash,
+        'reference_mode': args.reference_mode,
+        'reference_checkpoint_sha256': reference_checkpoint_hash,
+    })[:16]
     config_path = os.path.abspath(args.config) if args.config else ''
     config_hash = (
         sha256_file(config_path) if config_path
         else sha256_json(config.final_config_dict)
+    )
+    reference_config_path = (
+        os.path.abspath(args.reference_config)
+        if args.reference_config else ''
+    )
+    reference_config_hash = (
+        sha256_file(reference_config_path)
+        if reference_config_path else (
+            sha256_json(reference_config.final_config_dict)
+            if reference_config is not None else ''
+        )
     )
     cache_id = cache_metadata['cache_sha256'][:16]
     row = {
         'dataset': dataset_name,
         'model': model_name,
         'training_seed': training_seed,
+        'run_id': run_id,
         'checkpoint_id': checkpoint_id,
+        'reference_mode': args.reference_mode,
+        'reference_model': reference_model_name or model_name,
+        'reference_checkpoint_id': reference_checkpoint_id,
         'triplet_cache_id': cache_id,
         'num_triplets': int(len(triplets)),
         'num_pairwise_users': int(np.unique(triplets[:, 0]).size),
@@ -426,13 +576,17 @@ def evaluate_checkpoint(args):
     per_user_path = os.path.join(
         output_dir, 'per_user',
         '{}_{}_{}_{}.csv'.format(
-            dataset_name, model_name, training_seed, checkpoint_id
+            dataset_name, model_name, training_seed, run_id
         ),
     )
     write_csv(per_user_path, per_user)
     checks = {
+        'run_id': run_id,
         'checkpoint_id': checkpoint_id,
+        'reference_checkpoint_id': reference_checkpoint_id,
+        'reference_mode': args.reference_mode,
         'fused_adapter_max_abs_error': fused_score_max_error,
+        'reference_adapter_max_abs_error': reference_score_max_error,
         'C_hat_loss_identity_error': abs(
             pairwise['C_hat']
             - pairwise['reference_pairwise_loss']
@@ -456,7 +610,7 @@ def evaluate_checkpoint(args):
     checks_path = os.path.join(
         output_dir, 'checks',
         '{}_{}_{}_{}.json'.format(
-            dataset_name, model_name, training_seed, checkpoint_id
+            dataset_name, model_name, training_seed, run_id
         ),
     )
     atomic_json_dump(checks, checks_path)
@@ -465,20 +619,28 @@ def evaluate_checkpoint(args):
         'dataset': dataset_name,
         'model': model_name,
         'seed': training_seed,
+        'run_id': run_id,
         'checkpoint_path': checkpoint_path,
         'checkpoint_sha256': checkpoint_hash,
         'checkpoint_id': checkpoint_id,
+        'reference_mode': args.reference_mode,
+        'reference_model': reference_model_name or model_name,
+        'reference_checkpoint_path': reference_checkpoint_path or '',
+        'reference_checkpoint_sha256': reference_checkpoint_hash,
+        'reference_checkpoint_id': reference_checkpoint_id,
+        'reference_config_path': reference_config_path,
+        'reference_config_sha256': reference_config_hash,
         'config_path': config_path,
         'config_sha256': config_hash,
         'epoch': checkpoint.get('epoch', '') if isinstance(checkpoint, dict) else '',
     }
     upsert_csv(
         os.path.join(output_dir, 'checkpoint_manifest.csv'), manifest_row,
-        ('checkpoint_id',),
+        ('run_id',),
     )
     upsert_csv(
         os.path.join(output_dir, 'per_seed_metrics.csv'), row,
-        ('checkpoint_id', 'triplet_cache_id'),
+        ('run_id', 'triplet_cache_id'),
     )
 
     source_dir = os.path.dirname(os.path.abspath(__file__))
@@ -488,6 +650,8 @@ def evaluate_checkpoint(args):
         'k': args.k,
         'num_negatives': args.num_negatives,
         'sampling_seed': args.sampling_seed,
+        'reference_mode': args.reference_mode,
+        'reference_model': reference_model_name or model_name,
         'ranking_filter': 'train_positives_only',
         'tie_policy': 'score_descending_then_item_id_ascending',
         'pairwise_averaging': 'triplet_micro',
@@ -535,8 +699,13 @@ def evaluate_checkpoint(args):
         'num_items': dataset.item_num,
     }
     run_entry = {
+        'run_id': run_id,
         'checkpoint_id': checkpoint_id,
+        'reference_checkpoint_id': reference_checkpoint_id,
+        'reference_checkpoint_sha256': reference_checkpoint_hash,
         'model': model_name,
+        'reference_model': reference_model_name or model_name,
+        'reference_mode': args.reference_mode,
         'dataset': dataset_name,
         'training_seed': training_seed,
         'id_mapping_hash': mapping_hash,
@@ -546,13 +715,21 @@ def evaluate_checkpoint(args):
         'pairwise_batch_size': args.pairwise_batch_size,
         'user_batch_size': args.user_batch_size,
         'reference_score': (
+            'dot(backbone final users, backbone final items)'
+            if reference_model is not None else
             'dot(full_users, full_items + shared/full mm_items)'
         ),
         'fused_score': 'dot(fused users, final fused items)',
-        'reference_is_internal_branch': True,
+        'reference_is_internal_branch': reference_model is None,
         'source_functions': {
             'representations': 'models/*_masked.py::_encode',
             'fused_prediction': 'models/*_masked.py::full_sort_predict',
+            'reference_prediction': (
+                'models/{}/full_sort_predict'.format(
+                    (reference_model_name or '').lower()
+                ) if reference_model is not None else
+                'models/*_masked.py::_encode full branch'
+            ),
             'adapter': 'utils/complementarity.py::MaskedModelComplementarityScorer',
         },
     }
@@ -574,6 +751,18 @@ def build_parser():
     parser.add_argument('--model')
     parser.add_argument('--checkpoint', required=True)
     parser.add_argument('--config')
+    parser.add_argument(
+        '--reference-mode',
+        default='internal-full',
+        choices=('internal-full', 'backbone-checkpoint'),
+        help=(
+            'Use the PCML full branch or an independently trained original '
+            'backbone as the reference.'
+        ),
+    )
+    parser.add_argument('--reference-checkpoint')
+    parser.add_argument('--reference-model', choices=('PGL', 'FREEDOM'))
+    parser.add_argument('--reference-config')
     parser.add_argument('--data-path')
     parser.add_argument('--training-seed', type=int)
     parser.add_argument('--split', default='test', choices=('test',))

@@ -59,6 +59,29 @@ class FakeMaskedModel:
         )
 
 
+class FakePGL:
+    def __init__(self):
+        self.training = True
+        self.norm_adj = object()
+        self.users = torch.tensor([[0.4, 0.6], [0.7, 0.3]])
+        self.items = torch.tensor([
+            [1.0, 0.0], [0.0, 1.0], [0.5, 0.5]
+        ])
+
+    def eval(self):
+        self.training = False
+        return self
+
+    def forward(self, adjacency):
+        self.last_adjacency = adjacency
+        return self.users, self.items
+
+    def full_sort_predict(self, interaction):
+        return torch.matmul(
+            self.users[interaction[0]], self.items.transpose(0, 1)
+        )
+
+
 class ComplementarityMetricsTest(unittest.TestCase):
     def test_identical_margins_have_zero_contribution(self):
         margins = np.array([-0.5, 0.0, 0.4, 1.0])
@@ -212,6 +235,23 @@ class ComplementarityMetricsTest(unittest.TestCase):
         torch.testing.assert_close(
             scorer.embeddings['reference'][1], expected_reference_items
         )
+
+    def test_external_backbone_replaces_internal_reference(self):
+        masked = FakeMaskedModel()
+        backbone = FakePGL()
+        scorer = MaskedModelComplementarityScorer(
+            masked, reference_model=backbone, reference_model_name='PGL'
+        )
+        self.assertEqual(scorer.reference_source, 'backbone_checkpoint')
+        self.assertFalse(backbone.training)
+        torch.testing.assert_close(
+            scorer.embeddings['reference'][0], backbone.users
+        )
+        torch.testing.assert_close(
+            scorer.embeddings['reference'][1], backbone.items
+        )
+        self.assertEqual(scorer.check_reference_against_model([0, 1]), 0.0)
+        self.assertEqual(scorer.check_against_model([0, 1]), 0.0)
 
 
 if __name__ == '__main__':

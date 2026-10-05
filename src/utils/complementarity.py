@@ -375,29 +375,74 @@ def ranking_gained_lost(test_positives, reference_topk, fused_topk, k):
 
 
 class MaskedModelComplementarityScorer:
-    """Cache exact reference and fused inference representations once."""
+    """Cache fused PCML scores and either an internal or external reference."""
 
-    def __init__(self, model):
+    def __init__(self, model, reference_model=None, reference_model_name=None):
         self.model = model
         self.model.eval()
         with torch.inference_mode():
             representations = model._encode()
-        if representations.get('full_users') is None:
-            raise ValueError('Reference/full branch is unavailable.')
-        full_mm_items = representations.get('full_mm_items')
-        if full_mm_items is None:
-            full_mm_items = representations.get('mm_items')
-        if full_mm_items is None:
-            raise ValueError('Shared item-item representation is unavailable.')
-        self.embeddings = {
-            'reference': (
+        fused = (representations['users'], representations['items'])
+        self.reference_model = reference_model
+        self.reference_model_name = reference_model_name
+        if reference_model is None:
+            if representations.get('full_users') is None:
+                raise ValueError('Reference/full branch is unavailable.')
+            full_mm_items = representations.get('full_mm_items')
+            if full_mm_items is None:
+                full_mm_items = representations.get('mm_items')
+            if full_mm_items is None:
+                raise ValueError(
+                    'Shared item-item representation is unavailable.'
+                )
+            reference = (
                 representations['full_users'],
                 representations['full_items'] + full_mm_items,
-            ),
-            'fused': (
-                representations['users'], representations['items']
-            ),
-        }
+            )
+            self.reference_source = 'internal_full'
+        else:
+            reference_model.eval()
+            normalized_name = str(
+                reference_model_name
+                or reference_model.__class__.__name__
+            ).upper()
+            if normalized_name not in {'PGL', 'FREEDOM'}:
+                raise ValueError(
+                    'External reference supports only PGL or FREEDOM, got '
+                    '{}.'.format(normalized_name)
+                )
+            if not hasattr(reference_model, 'norm_adj'):
+                raise ValueError(
+                    'Backbone reference model has no norm_adj attribute.'
+                )
+            with torch.inference_mode():
+                reference = reference_model.forward(reference_model.norm_adj)
+            if not isinstance(reference, (tuple, list)) or len(reference) != 2:
+                raise ValueError(
+                    'Backbone forward must return (user_embeddings, '
+                    'item_embeddings).'
+                )
+            reference = tuple(reference)
+            self.reference_model_name = normalized_name
+            self.reference_source = 'backbone_checkpoint'
+
+        if reference[0].shape[0] != fused[0].shape[0]:
+            raise ValueError(
+                'Reference and PCML checkpoints have different user counts.'
+            )
+        if reference[1].shape[0] != fused[1].shape[0]:
+            raise ValueError(
+                'Reference and PCML checkpoints have different item counts.'
+            )
+        if reference[0].shape[1] != reference[1].shape[1]:
+            raise ValueError('Reference user/item embedding dimensions differ.')
+        if fused[0].shape[1] != fused[1].shape[1]:
+            raise ValueError('Fused user/item embedding dimensions differ.')
+        if reference[0].device != fused[0].device:
+            raise ValueError(
+                'Reference and PCML models must be on the same device.'
+            )
+        self.embeddings = {'reference': reference, 'fused': fused}
 
     def _ids(self, values):
         if torch.is_tensor(values):
@@ -451,6 +496,20 @@ class MaskedModelComplementarityScorer:
         torch.testing.assert_close(adapter, direct, atol=atol, rtol=rtol)
         return float((adapter - direct).abs().max().item())
 
+    @torch.inference_mode()
+    def check_reference_against_model(
+        self, users, atol=1e-6, rtol=1e-5
+    ):
+        """Check the external adapter against the backbone prediction path."""
+        if self.reference_model is None:
+            return None
+        users = self._ids(users)
+        adapter = self.score_all_items(users, 'reference')
+        direct = self.reference_model.full_sort_predict([users, None])
+        direct = direct.view_as(adapter)
+        torch.testing.assert_close(adapter, direct, atol=atol, rtol=rtol)
+        return float((adapter - direct).abs().max().item())
+
 
 def write_csv(path, rows, fieldnames=None):
     rows = list(rows)
@@ -497,16 +556,19 @@ def aggregate_seed_results(output_dir):
     if not rows:
         raise ValueError('per_seed_metrics.csv is empty.')
 
-    dataset_model_caches = defaultdict(set)
+    comparison_caches = defaultdict(set)
     groups = defaultdict(list)
     for row in rows:
-        dataset_model_caches[(row['dataset'], row['model'])].add(
-            row['triplet_cache_id']
+        reference_mode = row.get('reference_mode') or 'internal-full'
+        reference_model = row.get('reference_model') or row['model']
+        comparison = (
+            row['dataset'], row['model'], reference_mode, reference_model
         )
-        groups[(row['dataset'], row['model'], row['triplet_cache_id'])].append(row)
+        comparison_caches[comparison].add(row['triplet_cache_id'])
+        groups[comparison + (row['triplet_cache_id'],)].append(row)
     incompatible = {
         key: sorted(cache_ids)
-        for key, cache_ids in dataset_model_caches.items()
+        for key, cache_ids in comparison_caches.items()
         if len(cache_ids) > 1
     }
     if incompatible:
@@ -523,7 +585,9 @@ def aggregate_seed_results(output_dir):
         }
     ]
     summary_rows = []
-    for (dataset, model, cache_id), group_rows in sorted(groups.items()):
+    for (
+        dataset, model, reference_mode, reference_model, cache_id
+    ), group_rows in sorted(groups.items()):
         seeds = [row['training_seed'] for row in group_rows]
         if len(seeds) != len(set(seeds)):
             raise ValueError(
@@ -533,6 +597,8 @@ def aggregate_seed_results(output_dir):
         summary = {
             'dataset': dataset,
             'model': model,
+            'reference_mode': reference_mode,
+            'reference_model': reference_model,
             'triplet_cache_id': cache_id,
             'n_seeds': len(seeds),
         }
@@ -557,9 +623,9 @@ def aggregate_seed_results(output_dir):
         os.path.join(output_dir, 'summary_metrics.csv'), summary_rows
     )
     markdown = [
-        '| Dataset | Model | Seeds | C_hat | Correction (%) | Damage (%) '
+        '| Dataset | Model | Reference | Seeds | C_hat | Correction (%) | Damage (%) '
         '| Gained@20 | Lost@20 | Delta R@20 |',
-        '|---|---|---:|---:|---:|---:|---:|---:|---:|',
+        '|---|---|---|---:|---:|---:|---:|---:|---:|---:|',
     ]
 
     def display(row, metric, scale=1.0):
@@ -573,9 +639,12 @@ def aggregate_seed_results(output_dir):
 
     for row in summary_rows:
         markdown.append(
-            '| {dataset} | {model} | {n_seeds} | {c_hat} | {correction} '
+            '| {dataset} | {model} | {reference} | {n_seeds} | {c_hat} | {correction} '
             '| {damage} | {gained} | {lost} | {delta} |'.format(
                 dataset=row['dataset'], model=row['model'],
+                reference='{}:{}'.format(
+                    row['reference_mode'], row['reference_model']
+                ),
                 n_seeds=row['n_seeds'], c_hat=display(row, 'C_hat'),
                 correction=display(row, 'correction_rate', 100.0),
                 damage=display(row, 'damage_rate', 100.0),
